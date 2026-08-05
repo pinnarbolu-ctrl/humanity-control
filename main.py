@@ -23,7 +23,7 @@ def main():
     technical_analysis = TechnicalAnalysis()
     signal_engine = SignalEngine()
 
-    # Anlık H/TRY piyasa verisini al
+    # BTCTurk anlık H/TRY verisini al
     market_data = tracker.get_market_data()
 
     # Son 200 adet 1 saatlik mumu al
@@ -32,61 +32,142 @@ def main():
         limit=200,
     )
 
-    # EMA 20 ve EMA 50 trend analizini yap
-    ema_analysis = technical_analysis.analyze_ema(candles)
+    # EMA, RSI, MACD ve hacim analizlerini yap
+    technical_result = technical_analysis.analyze(
+        candles
+    )
 
-    # Piyasa verisini ve EMA analizini karar motoruna gönder
+    # Bütün sonuçları karar motoruna gönder
     signal_result = signal_engine.analyze(
         market_data,
-        ema_analysis,
+        technical_result,
     )
+
+    logging.info("--------------------------------")
 
     if market_data:
         logging.info(
             "H/TRY fiyatı: %s TRY",
             market_data.get("price"),
         )
+
         logging.info(
             "24 saatlik değişim: %s%%",
             market_data.get("change_24h"),
         )
+
+        logging.info(
+            "24 saatlik en yüksek: %s",
+            market_data.get("high_24h"),
+        )
+
+        logging.info(
+            "24 saatlik en düşük: %s",
+            market_data.get("low_24h"),
+        )
+
+        logging.info(
+            "Alış fiyatı: %s",
+            market_data.get("bid"),
+        )
+
+        logging.info(
+            "Satış fiyatı: %s",
+            market_data.get("ask"),
+        )
+
     else:
-        logging.warning("H/TRY piyasa verisi alınamadı.")
+        logging.warning(
+            "H/TRY piyasa verisi alınamadı."
+        )
 
     logging.info(
         "Alınan mum sayısı: %s",
         len(candles),
     )
 
+    logging.info("--------------------------------")
+
+    ema_result = technical_result.get("ema", {})
+
     logging.info(
         "EMA 20: %s",
-        ema_analysis.get("ema_20"),
-    )
-    logging.info(
-        "EMA 50: %s",
-        ema_analysis.get("ema_50"),
-    )
-    logging.info(
-        "EMA trendi: %s",
-        ema_analysis.get("trend"),
-    )
-    logging.info(
-        "Trend açıklaması: %s",
-        ema_analysis.get("reason"),
+        ema_result.get("ema_20"),
     )
 
     logging.info(
-        "Karar: %s",
+        "EMA 50: %s",
+        ema_result.get("ema_50"),
+    )
+
+    logging.info(
+        "EMA trendi: %s",
+        ema_result.get("trend"),
+    )
+
+    logging.info(
+        "RSI: %s",
+        technical_result.get("rsi"),
+    )
+
+    logging.info(
+        "RSI durumu: %s",
+        technical_result.get("rsi_status"),
+    )
+
+    logging.info(
+        "MACD: %s",
+        technical_result.get("macd"),
+    )
+
+    logging.info(
+        "MACD sinyal çizgisi: %s",
+        technical_result.get("macd_signal"),
+    )
+
+    logging.info(
+        "MACD histogramı: %s",
+        technical_result.get("macd_histogram"),
+    )
+
+    logging.info(
+        "MACD trendi: %s",
+        technical_result.get("macd_trend"),
+    )
+
+    volume_result = technical_result.get(
+        "volume",
+        {},
+    )
+
+    logging.info(
+        "Hacim oranı: %s",
+        volume_result.get("volume_ratio"),
+    )
+
+    logging.info(
+        "Hacim durumu: %s",
+        volume_result.get("status"),
+    )
+
+    logging.info("--------------------------------")
+
+    logging.info(
+        "Nihai karar: %s",
         signal_result.get("signal"),
     )
+
     logging.info(
-        "Karar skoru: %s",
+        "Karar skoru: %s/100",
         signal_result.get("score"),
     )
+
     logging.info(
-        "Karar sebebi: %s",
+        "Karar açıklaması: %s",
         signal_result.get("reason"),
     )
+
+    logging.info("--------------------------------")
 
 
 if __name__ == "__main__":
