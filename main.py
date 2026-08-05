@@ -35,8 +35,11 @@ def main():
     # EMA 20 ve EMA 50 trend analizini yap
     ema_analysis = technical_analysis.analyze_ema(candles)
 
-    # Şimdilik karar motoru yalnızca piyasa verisini kullanıyor
-    signal_result = signal_engine.analyze(market_data)
+    # Piyasa verisini ve EMA analizini karar motoruna gönder
+    signal_result = signal_engine.analyze(
+        market_data,
+        ema_analysis,
+    )
 
     if market_data:
         logging.info(
@@ -75,6 +78,10 @@ def main():
     logging.info(
         "Karar: %s",
         signal_result.get("signal"),
+    )
+    logging.info(
+        "Karar skoru: %s",
+        signal_result.get("score"),
     )
     logging.info(
         "Karar sebebi: %s",
