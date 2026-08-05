@@ -11,20 +11,22 @@ class SignalEngine:
     SELL = "SELL"
     WAIT = "WAIT"
 
-    def analyze(self, market_data, ema_analysis=None):
+    def analyze(self, market_data, technical_result=None):
         """
-        Piyasa verisini ve EMA analizini değerlendirir.
+        EMA, RSI, MACD ve hacim sonuçlarını puanlar.
 
-        Şimdilik EMA yalnızca yön puanı verir.
-        RSI ve hacim onayı eklenmeden doğrudan
-        BUY veya SELL sinyali üretilmez.
+        Puan aralığı:
+        75–100: BUY
+        26–74: WAIT
+        0–25: SELL
         """
 
         if not market_data:
             return {
                 "signal": self.WAIT,
-                "score": 0,
+                "score": 50,
                 "reason": "Piyasa verisi alınamadı.",
+                "details": {},
             }
 
         price = market_data.get("price")
@@ -32,38 +34,178 @@ class SignalEngine:
         if price is None or price <= 0:
             return {
                 "signal": self.WAIT,
-                "score": 0,
+                "score": 50,
                 "reason": "Geçerli fiyat verisi bulunamadı.",
+                "details": {},
             }
 
-        if not ema_analysis:
+        if not technical_result:
             return {
                 "signal": self.WAIT,
-                "score": 0,
-                "reason": "EMA analizi bulunamadı.",
+                "score": 50,
+                "reason": "Teknik analiz sonucu bulunamadı.",
+                "details": {},
             }
 
-        trend = ema_analysis.get("trend", "UNKNOWN")
-
-        score = 0
+        score = 50
         reasons = []
+        details = {}
 
-        if trend == "BULLISH":
-            score += 1
-            reasons.append("EMA trendi yükseliş yönünde.")
+        # -------------------------------------------------
+        # EMA ANALİZİ
+        # -------------------------------------------------
 
-        elif trend == "BEARISH":
-            score -= 1
-            reasons.append("EMA trendi düşüş yönünde.")
+        ema_result = technical_result.get("ema", {})
+        ema_trend = ema_result.get("trend", "UNKNOWN")
 
-        elif trend == "NEUTRAL":
+        details["ema_trend"] = ema_trend
+
+        if ema_trend == "BULLISH":
+            score += 20
+            reasons.append("EMA yükseliş trendinde.")
+
+        elif ema_trend == "BEARISH":
+            score -= 20
+            reasons.append("EMA düşüş trendinde.")
+
+        elif ema_trend == "NEUTRAL":
             reasons.append("EMA trendi kararsız.")
 
         else:
-            reasons.append("EMA trendi hesaplanamadı.")
+            reasons.append("EMA analizi hesaplanamadı.")
+
+        # -------------------------------------------------
+        # RSI ANALİZİ
+        # -------------------------------------------------
+
+        rsi = technical_result.get("rsi")
+        rsi_status = technical_result.get(
+            "rsi_status",
+            "UNKNOWN",
+        )
+
+        details["rsi"] = rsi
+        details["rsi_status"] = rsi_status
+
+        if rsi_status == "OVERSOLD":
+            score += 15
+            reasons.append(
+                "RSI aşırı satım bölgesinde."
+            )
+
+        elif rsi_status == "OVERBOUGHT":
+            score -= 15
+            reasons.append(
+                "RSI aşırı alım bölgesinde."
+            )
+
+        elif rsi_status == "NEUTRAL":
+            reasons.append("RSI nötr bölgede.")
+
+        else:
+            reasons.append("RSI hesaplanamadı.")
+
+        # -------------------------------------------------
+        # MACD ANALİZİ
+        # -------------------------------------------------
+
+        macd_trend = technical_result.get(
+            "macd_trend",
+            "UNKNOWN",
+        )
+
+        details["macd_trend"] = macd_trend
+        details["macd"] = technical_result.get("macd")
+        details["macd_signal"] = technical_result.get(
+            "macd_signal"
+        )
+        details["macd_histogram"] = technical_result.get(
+            "macd_histogram"
+        )
+
+        if macd_trend == "BULLISH":
+            score += 20
+            reasons.append("MACD yükselişi destekliyor.")
+
+        elif macd_trend == "BEARISH":
+            score -= 20
+            reasons.append("MACD düşüşü destekliyor.")
+
+        elif macd_trend == "NEUTRAL":
+            reasons.append("MACD kararsız.")
+
+        else:
+            reasons.append("MACD hesaplanamadı.")
+
+        # -------------------------------------------------
+        # HACİM ANALİZİ
+        # -------------------------------------------------
+
+        volume_result = technical_result.get(
+            "volume",
+            {},
+        )
+
+        volume_status = volume_result.get(
+            "status",
+            "UNKNOWN",
+        )
+
+        volume_ratio = volume_result.get(
+            "volume_ratio"
+        )
+
+        details["volume_status"] = volume_status
+        details["volume_ratio"] = volume_ratio
+
+        if volume_status == "STRONG":
+            if score > 50:
+                score += 10
+                reasons.append(
+                    "Güçlü hacim yükselişi destekliyor."
+                )
+
+            elif score < 50:
+                score -= 10
+                reasons.append(
+                    "Güçlü hacim düşüşü destekliyor."
+                )
+
+            else:
+                reasons.append(
+                    "Hacim güçlü ancak yön henüz net değil."
+                )
+
+        elif volume_status == "NORMAL":
+            reasons.append("Hacim normal seviyede.")
+
+        elif volume_status == "WEAK":
+            reasons.append(
+                "Hacim zayıf, hareket teyit edilmedi."
+            )
+
+        else:
+            reasons.append("Hacim analizi yapılamadı.")
+
+        # Puanı 0–100 arasında tut
+        score = max(0, min(100, score))
+
+        # -------------------------------------------------
+        # NİHAİ KARAR
+        # -------------------------------------------------
+
+        if score >= 75:
+            signal = self.BUY
+
+        elif score <= 25:
+            signal = self.SELL
+
+        else:
+            signal = self.WAIT
 
         return {
-            "signal": self.WAIT,
+            "signal": signal,
             "score": score,
             "reason": " ".join(reasons),
+            "details": details,
         }
