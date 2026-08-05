@@ -1,25 +1,86 @@
+"""
+Humanity Control Bot
+Ana çalışma dosyası
+"""
+
 import logging
-from pathlib import Path
 
-APP_NAME = "H AI"
-VERSION = "1.0.0"
+from analysis.technical_analysis import TechnicalAnalysis
+from market.humanity_tracker import HumanityTracker
+from strategy.signal_engine import SignalEngine
 
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
+
 def main():
-    logging.info("=" * 50)
-    logging.info(f"{APP_NAME} v{VERSION} başlatıldı")
-    logging.info("Foundation Commit 1")
-    logging.info("Veri klasörü hazır.")
-    logging.info("Yapay zeka modülleri daha sonra eklenecek.")
-    logging.info("=" * 50)
+    logging.info("Humanity Control Bot başlatılıyor...")
+
+    tracker = HumanityTracker()
+    technical_analysis = TechnicalAnalysis()
+    signal_engine = SignalEngine()
+
+    # Anlık H/TRY piyasa verisini al
+    market_data = tracker.get_market_data()
+
+    # Son 200 adet 1 saatlik mumu al
+    candles = tracker.get_candles(
+        resolution="1h",
+        limit=200,
+    )
+
+    # EMA 20 ve EMA 50 trend analizini yap
+    ema_analysis = technical_analysis.analyze_ema(candles)
+
+    # Şimdilik karar motoru yalnızca piyasa verisini kullanıyor
+    signal_result = signal_engine.analyze(market_data)
+
+    if market_data:
+        logging.info(
+            "H/TRY fiyatı: %s TRY",
+            market_data.get("price"),
+        )
+        logging.info(
+            "24 saatlik değişim: %s%%",
+            market_data.get("change_24h"),
+        )
+    else:
+        logging.warning("H/TRY piyasa verisi alınamadı.")
+
+    logging.info(
+        "Alınan mum sayısı: %s",
+        len(candles),
+    )
+
+    logging.info(
+        "EMA 20: %s",
+        ema_analysis.get("ema_20"),
+    )
+    logging.info(
+        "EMA 50: %s",
+        ema_analysis.get("ema_50"),
+    )
+    logging.info(
+        "EMA trendi: %s",
+        ema_analysis.get("trend"),
+    )
+    logging.info(
+        "Trend açıklaması: %s",
+        ema_analysis.get("reason"),
+    )
+
+    logging.info(
+        "Karar: %s",
+        signal_result.get("signal"),
+    )
+    logging.info(
+        "Karar sebebi: %s",
+        signal_result.get("reason"),
+    )
+
 
 if __name__ == "__main__":
     main()
