@@ -17,7 +17,6 @@ class HumanityTracker:
         """
         BTCTurk API üzerinden H/TRY piyasa verilerini alır.
         """
-
         try:
             response = requests.get(
                 self.api_url,
@@ -53,6 +52,20 @@ class HumanityTracker:
         except (TypeError, ValueError, KeyError) as error:
             logging.error("BTCTurk veri işleme hatası: %s", error)
             return None
+
+    def get_candles(self, resolution="1h", limit=200):
+        """
+        BTCTurk mum verilerini alır.
+
+        Şimdilik iskelet hazır.
+        Bir sonraki committe gerçek Candle API eklenecek.
+        """
+        logging.info(
+            "Mum verisi özelliği hazırlanıyor. "
+            "Bir sonraki committe BTCTurk Candle API bağlanacak."
+        )
+
+        return []
 
     def run(self):
         logging.info("Humanity Tracker çalışıyor...")
