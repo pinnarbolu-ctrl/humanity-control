@@ -17,8 +17,8 @@ class TelegramNotifier:
         Telegram bilgilerini ortam değişkenlerinden okur.
 
         Gerekli değişkenler:
-        BOT_TOKEN = "8855467313:AAHYdR1ts-liJ0hMwxxPGpgmrPne6ydFOpI"
-        CHAT_IDS = [2097448038]
+        TELEGRAM_BOT_TOKEN
+        TELEGRAM_CHAT_ID
         """
 
         self.bot_token = os.getenv(
