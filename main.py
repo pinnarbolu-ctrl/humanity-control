@@ -8,6 +8,7 @@ import logging
 from analysis.technical_analysis import TechnicalAnalysis
 from market.humanity_tracker import HumanityTracker
 from strategy.signal_engine import SignalEngine
+from telegram.telegram_notifier import TelegramNotifier
 
 
 logging.basicConfig(
@@ -22,6 +23,7 @@ def main():
     tracker = HumanityTracker()
     technical_analysis = TechnicalAnalysis()
     signal_engine = SignalEngine()
+    telegram_notifier = TelegramNotifier()
 
     # BTCTurk anlık H/TRY verisini al
     market_data = tracker.get_market_data()
@@ -37,7 +39,7 @@ def main():
         candles
     )
 
-    # Bütün sonuçları karar motoruna gönder
+    # Teknik analizleri karar motoruna gönder
     signal_result = signal_engine.analyze(
         market_data,
         technical_result,
@@ -88,7 +90,10 @@ def main():
 
     logging.info("--------------------------------")
 
-    ema_result = technical_result.get("ema", {})
+    ema_result = technical_result.get(
+        "ema",
+        {},
+    )
 
     logging.info(
         "EMA 20: %s",
@@ -165,6 +170,25 @@ def main():
     logging.info(
         "Karar açıklaması: %s",
         signal_result.get("reason"),
+    )
+
+    # Telegram mesajını hazırla
+    telegram_message = (
+        telegram_notifier.format_signal_message(
+            market_data,
+            technical_result,
+            signal_result,
+        )
+    )
+
+    # Telegram'a gönder
+    telegram_sent = telegram_notifier.send_message(
+        telegram_message
+    )
+
+    logging.info(
+        "Telegram gönderim sonucu: %s",
+        "Başarılı" if telegram_sent else "Gönderilmedi",
     )
 
     logging.info("--------------------------------")
