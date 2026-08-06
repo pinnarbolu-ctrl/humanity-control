@@ -1,3 +1,29 @@
+
+
+# ===== Kalıcı son sinyal kontrolü =====
+LAST_SIGNAL_FILE = "last_signal.json"
+
+def should_send_signal(signal_result):
+    try:
+        if os.path.exists(LAST_SIGNAL_FILE):
+            with open(LAST_SIGNAL_FILE,"r",encoding="utf-8") as f:
+                last=json.load(f)
+        else:
+            last=None
+    except Exception:
+        last=None
+
+    current=signal_result.get("signal")
+    if last and last.get("signal")==current:
+        return False
+
+    with open(LAST_SIGNAL_FILE,"w",encoding="utf-8") as f:
+        json.dump({
+            "signal":current,
+            "score":signal_result.get("score")
+        },f,ensure_ascii=False,indent=2)
+    return True
+
 """
 Humanity Control Bot
 Ana çalışma dosyası
