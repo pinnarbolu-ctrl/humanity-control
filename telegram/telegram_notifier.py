@@ -10,6 +10,11 @@ import os
 
 import requests
 
+import json
+from pathlib import Path
+
+_LAST_SIGNAL_FILE = Path("last_signal.json")
+
 
 class TelegramNotifier:
     def __init__(self):
@@ -81,6 +86,17 @@ class TelegramNotifier:
             )
 
             response.raise_for_status()
+
+            try:
+                if _LAST_SIGNAL_FILE.exists():
+                    last=json.loads(_LAST_SIGNAL_FILE.read_text(encoding="utf-8")).get("signal")
+                    current=message.split("\n",2)[1] if "\n" in message else message
+                    if last==current:
+                        logging.info("Sinyal değişmedi, mesaj gönderilmedi.")
+                        return True
+                    _LAST_SIGNAL_FILE.write_text(json.dumps({"signal":current}),encoding="utf-8")
+            except Exception:
+                pass
 
             result = response.json()
 
