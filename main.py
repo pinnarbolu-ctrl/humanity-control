@@ -194,5 +194,13 @@ def main():
     logging.info("--------------------------------")
 
 
+import time
+
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception:
+            logging.exception("Ana döngü hatası")
+        time.sleep(300)
+
