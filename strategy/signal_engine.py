@@ -11,6 +11,10 @@ class SignalEngine:
     SELL = "SELL"
     WAIT = "WAIT"
 
+    def __init__(self):
+        self.last_signal = None
+
+
     def analyze(self, market_data, technical_result=None):
         """
         EMA, RSI, MACD ve hacim sonuçlarını puanlar.
