@@ -203,9 +203,26 @@ class SignalEngine:
         else:
             signal = self.WAIT
 
+        notify = (signal != self.last_signal)
+        self.last_signal = signal
+
+        if score >= 90:
+            strength = "VERY_STRONG"
+        elif score >= 75:
+            strength = "STRONG"
+        elif score <= 10:
+            strength = "VERY_WEAK"
+        elif score <= 25:
+            strength = "WEAK"
+        else:
+            strength = "NEUTRAL"
+
         return {
             "signal": signal,
             "score": score,
+            "confidence": score,
+            "strength": strength,
+            "notify": notify,
             "reason": " ".join(reasons),
             "details": details,
         }
