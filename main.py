@@ -14,15 +14,24 @@ def should_send_signal(signal_result):
         last=None
 
     current=signal_result.get("signal")
-    if last and last.get("signal")==current:
-        return False
+
+    # Her kararı hafızaya al. Böylece WAIT/BEKLE Telegram'a gitmese bile
+    # WAIT -> AL veya WAIT -> SAT geçişi yeni sinyal olarak algılanır.
+    changed = not (last and last.get("signal") == current)
 
     with open(LAST_SIGNAL_FILE,"w",encoding="utf-8") as f:
         json.dump({
             "signal":current,
             "score":signal_result.get("score")
         },f,ensure_ascii=False,indent=2)
-    return True
+
+    if not changed:
+        return False
+
+    # Telegram yalnızca gerçek AL/SAT sinyallerini göndersin.
+    # WAIT/BEKLE kararları arka planda izlenir, mesaj olarak gönderilmez.
+    normalized = str(current or "").strip().upper()
+    return normalized in {"BUY", "AL", "SELL", "SAT"}
 
 """
 Humanity Control Bot
@@ -209,7 +218,7 @@ def main():
         )
     )
 
-    # Telegram'a sadece sinyal değiştiyse gönder
+    # Telegram'a yalnızca değişen AL/SAT sinyalini gönder
     if should_send_signal(signal_result):
         telegram_sent = telegram_notifier.send_message(
             telegram_message
@@ -221,7 +230,7 @@ def main():
         )
     else:
         logging.info(
-            "Sinyal değişmedi. Telegram mesajı gönderilmedi."
+            "AL/SAT sinyali yok veya sinyal değişmedi. Telegram mesajı gönderilmedi."
         )
 
     logging.info("--------------------------------")
