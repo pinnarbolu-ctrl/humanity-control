@@ -30,6 +30,8 @@ Ana çalışma dosyası
 """
 
 import logging
+import json
+import os
 
 from analysis.technical_analysis import TechnicalAnalysis
 from market.humanity_tracker import HumanityTracker
@@ -207,15 +209,20 @@ def main():
         )
     )
 
-    # Telegram'a gönder
-    telegram_sent = telegram_notifier.send_message(
-        telegram_message
-    )
+    # Telegram'a sadece sinyal değiştiyse gönder
+    if should_send_signal(signal_result):
+        telegram_sent = telegram_notifier.send_message(
+            telegram_message
+        )
 
-    logging.info(
-        "Telegram gönderim sonucu: %s",
-        "Başarılı" if telegram_sent else "Gönderilmedi",
-    )
+        logging.info(
+            "Telegram gönderim sonucu: %s",
+            "Başarılı" if telegram_sent else "Gönderilmedi",
+        )
+    else:
+        logging.info(
+            "Sinyal değişmedi. Telegram mesajı gönderilmedi."
+        )
 
     logging.info("--------------------------------")
 
