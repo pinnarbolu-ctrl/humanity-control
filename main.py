@@ -1,5 +1,5 @@
 """
-Humanity Assistant V3.3 - Gözlem ve Tekrarsız AL Sürümü
+Humanity Assistant V3.4 - Mikro Aday + Gözlem Sürümü
 
 Amaç
 -----
@@ -85,6 +85,12 @@ MAX_HISTORY = 240
 EARLY_SCORE = 55
 STRONG_SCORE = 70
 VERY_STRONG_SCORE = 82
+
+# Mikro Aday mevcut 55/70/82 eşiklerini DEĞİŞTİRMEZ.
+# Amaç: güçlü adaydan önce kısa vadeli uyanışı haber vermek.
+MICRO_M1_MIN = 0.30
+MICRO_M3_MIN = 0.20
+MICRO_STAIR_TOTAL_MIN = 0.25
 
 # Aynı kategoride gereksiz Telegram tekrarını engeller.
 ALERT_COOLDOWN_SECONDS = 12 * 60
@@ -265,6 +271,36 @@ def _price_momentum(history, current_price):
     return result
 
 
+def _micro_staircase(history):
+    """
+    Son 4 adet yaklaşık 60 sn snapshot içinde mikro basamak arar.
+
+    Amaç mum formasyonu taklidi yapmak değil; fiyatın birkaç tarama boyunca
+    yukarı doğru küçük adımlar üretip üretmediğini görmek.
+    """
+    if len(history) < 4:
+        return False, 0.0, 0
+
+    prices = [_to_float(x.get("price")) for x in history[-4:]]
+    if any(p is None or p <= 0 for p in prices):
+        return False, 0.0, 0
+
+    steps = []
+    for old, new in zip(prices, prices[1:]):
+        steps.append(((new / old) - 1.0) * 100.0)
+
+    positive_steps = sum(1 for step in steps if step >= 0.03)
+    deep_pullback = any(step <= -0.25 for step in steps)
+    total_move = ((prices[-1] / prices[0]) - 1.0) * 100.0
+
+    staircase = (
+        positive_steps >= 2
+        and total_move >= MICRO_STAIR_TOTAL_MIN
+        and not deep_pullback
+    )
+    return staircase, total_move, positive_steps
+
+
 # -----------------------------------------------------------------------------
 # Tek coin Assistant skoru
 # -----------------------------------------------------------------------------
@@ -290,6 +326,8 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
     m3 = momentum.get("m3")
     m5 = momentum.get("m5")
     m15 = momentum.get("m15")
+
+    micro_staircase, micro_stair_move, micro_positive_steps = _micro_staircase(history)
 
     ema_positive = _positive_text(current.get("ema_trend"))
     macd_positive = _positive_text(current.get("macd_trend")) or (
@@ -461,7 +499,38 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
         ]
     )
 
-    # Adaylığı sadece skor değil, momentum + teyit belirler.
+    # Mikro Aday: skordan bağımsız, çok erken momentum uyanışı.
+    # Hacim bonus/teyittir; zorunlu değildir.
+    micro_direct = (
+        m1 is not None and m3 is not None
+        and m1 >= MICRO_M1_MIN
+        and m3 >= MICRO_M3_MIN
+    )
+    micro_stair_trigger = (
+        micro_staircase
+        and m1 is not None and m3 is not None
+        and m1 >= 0.15
+        and m3 >= 0.25
+    )
+    micro_technical_support = (
+        ema_positive
+        or macd_positive
+        or rsi_healthy
+        or engine_score >= 70
+    )
+    micro_candidate = (
+        enough_history
+        and not volume_without_momentum
+        and micro_technical_support
+        and (micro_direct or micro_stair_trigger)
+    )
+
+    if micro_candidate:
+        if micro_staircase:
+            reasons.append("mikro basamak oluşuyor")
+        reasons.append("kısa momentum uyanıyor")
+
+    # Mevcut 55/70/82 eşikleri aynen korunur.
     if not enough_history or volume_without_momentum:
         level = "IZLEME"
     elif score >= VERY_STRONG_SCORE and confirmation_count >= 5 and positive_momentum:
@@ -470,6 +539,8 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
         level = "GUCLENEN_ADAY"
     elif score >= EARLY_SCORE and confirmation_count >= 3 and positive_momentum:
         level = "ERKEN_ADAY"
+    elif micro_candidate:
+        level = "MIKRO_ADAY"
     else:
         level = "IZLEME"
 
@@ -489,6 +560,10 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
         "entry_quality": round(entry_quality, 1),
         "momentum": momentum,
         "acceleration": acceleration,
+        "micro_candidate": micro_candidate,
+        "micro_staircase": micro_staircase,
+        "micro_stair_move": round(micro_stair_move, 3),
+        "micro_positive_steps": micro_positive_steps,
         "volume_ratio": volume_ratio,
         "prev_volume_ratio": prev_volume,
         "volume_strengthening": volume_strengthening,
@@ -513,12 +588,14 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
 
 LEVEL_RANK = {
     "IZLEME": 0,
-    "ERKEN_ADAY": 1,
-    "GUCLENEN_ADAY": 2,
-    "AL_ONCESI_GUCLU": 3,
+    "MIKRO_ADAY": 1,
+    "ERKEN_ADAY": 2,
+    "GUCLENEN_ADAY": 3,
+    "AL_ONCESI_GUCLU": 4,
 }
 
 LEVEL_TITLE = {
+    "MIKRO_ADAY": "🔎 H/TRY MİKRO ADAY",
     "ERKEN_ADAY": "👀 H/TRY ERKEN ADAY",
     "GUCLENEN_ADAY": "🚀 H/TRY GÜÇLENEN ADAY",
     "AL_ONCESI_GUCLU": "🔥 H/TRY AL ÖNCESİ GÜÇLÜ TAKİP",
@@ -592,8 +669,15 @@ def _build_assistant_message(market_data, analysis, reason):
         else:
             lines.append(f"📊 Hacim: {volume:.2f}x")
 
+    if analysis.get("micro_staircase"):
+        lines.append(
+            f"🪜 Mikro basamak ✅ • 4 taramada %{analysis.get('micro_stair_move', 0):+.2f}"
+        )
+
     if analysis.get("acceleration") is not None and analysis["acceleration"] >= 0.30:
         lines.append("⚡ Momentum güçleniyor")
+    elif analysis.get("micro_candidate"):
+        lines.append("⚡ Kısa momentum uyanıyor")
 
     rsi = analysis.get("rsi")
     prev_rsi = analysis.get("prev_rsi")
@@ -619,7 +703,9 @@ def _build_assistant_message(market_data, analysis, reason):
     if analysis.get("warnings"):
         lines.append("⚠️ " + " • ".join(analysis["warnings"][:2]))
 
-    if reason == "LEVEL_UP":
+    if analysis["level"] == "MIKRO_ADAY":
+        lines.append("ℹ️ Çok erken takip — AL değil, hareket uyanışı.")
+    elif reason == "LEVEL_UP":
         lines.append("ℹ️ Seviye yükseldi — henüz nihai AL değil.")
     else:
         lines.append("ℹ️ Aday güçlenmeye devam ediyor — henüz nihai AL değil.")
@@ -740,6 +826,10 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
             "volume_strengthening": analysis.get("volume_strengthening"),
             "acceleration": analysis.get("acceleration"),
             "confirmation_count": analysis.get("confirmation_count"),
+            "micro_candidate": analysis.get("micro_candidate"),
+            "micro_staircase": analysis.get("micro_staircase"),
+            "micro_stair_move": analysis.get("micro_stair_move"),
+            "micro_positive_steps": analysis.get("micro_positive_steps"),
             "reasons": analysis.get("reasons", []),
             "warnings": analysis.get("warnings", []),
         }
@@ -785,7 +875,7 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
 
 
 def main():
-    logging.info("Humanity Assistant V3.3 GÖZLEM başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
+    logging.info("Humanity Assistant V3.4 MİKRO ADAY başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | ana eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
 
     # Telegram ayarı yoksa bot sessizce çalışmasın; deploy logunda net hata versin.
     validate_telegram_config()
