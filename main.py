@@ -68,6 +68,7 @@ def validate_telegram_config():
 
 
 SCAN_INTERVAL_SECONDS = 60
+TECH_REFRESH_SECONDS = 15 * 60  # 200 adet 1h mum 15 dakikada bir yenilenir
 STATE_FILE = "humanity_assistant_state.json"
 LAST_SIGNAL_FILE = "last_signal.json"
 
@@ -637,20 +638,38 @@ def process_assistant_alert(state, market_data, analysis, telegram_notifier):
 # Ana tarama
 # -----------------------------------------------------------------------------
 
-def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier):
+def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech_cache):
     market_data = tracker.get_market_data()
     if not market_data:
         logging.warning("H/TRY piyasa verisi alınamadı; tarama sessiz geçildi.")
         return
 
-    # 1 saatlik mumlar ana teknik trend için korunur. Erken hareket ise 60 sn snapshot
-    # geçmişinden hesaplanır; böylece tracker'ın 5m mum desteklemesine bağımlı değiliz.
-    candles = tracker.get_candles(resolution="1h", limit=200)
-    if not candles:
-        logging.warning("H/TRY mum verisi alınamadı; tarama sessiz geçildi.")
-        return
+    # 200 adet 1 saatlik mum yalnızca ANA TREND için tutulur.
+    # Her 60 saniyede yeniden çekilmez; 15 dakikada bir yenilenir.
+    now = time.time()
+    technical_result = tech_cache.get("technical_result")
+    last_refresh = float(tech_cache.get("last_refresh") or 0)
 
-    technical_result = technical_analysis.analyze(candles)
+    refresh_needed = (
+        technical_result is None
+        or (now - last_refresh) >= TECH_REFRESH_SECONDS
+    )
+
+    if refresh_needed:
+        candles = tracker.get_candles(resolution="1h", limit=200)
+        if candles:
+            technical_result = technical_analysis.analyze(candles)
+            tech_cache["technical_result"] = technical_result
+            tech_cache["last_refresh"] = now
+            logging.info("🔄 200 adet H/TRY 1h mum ana trend için yenilendi.")
+        elif technical_result is None:
+            logging.warning("H/TRY mum verisi alınamadı ve teknik önbellek boş; tarama sessiz geçildi.")
+            return
+        else:
+            logging.warning("1h mum yenileme başarısız; son geçerli ana trend kullanılmaya devam ediyor.")
+
+    # Anlık fiyat her 60 saniyede yenidir; teknik ana trend son geçerli 15 dakikalık
+    # önbellekten gelir. Kısa momentum 1/3/5/15 dk snapshot geçmişinden hesaplanır.
     signal_result = signal_engine.analyze(market_data, technical_result)
 
     state = _load_json(STATE_FILE, {})
@@ -713,7 +732,7 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier):
 
 
 def main():
-    logging.info("Humanity Assistant V3.1 başlatılıyor | tarama: %ss", SCAN_INTERVAL_SECONDS)
+    logging.info("Humanity Assistant V3.2 başlatılıyor | tarama: %ss | 1h trend yenileme: %ss", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS)
 
     # Telegram ayarı yoksa bot sessizce çalışmasın; deploy logunda net hata versin.
     validate_telegram_config()
@@ -724,6 +743,12 @@ def main():
     signal_engine = SignalEngine()
     telegram_notifier = TelegramNotifier()
 
+    # 1h teknik analiz önbelleği: ilk taramada doldurulur, sonra 15 dakikada bir yenilenir.
+    tech_cache = {
+        "technical_result": None,
+        "last_refresh": 0,
+    }
+
     while True:
         started = time.time()
         try:
@@ -732,6 +757,7 @@ def main():
                 technical_analysis,
                 signal_engine,
                 telegram_notifier,
+                tech_cache,
             )
         except Exception:
             logging.exception("Ana tarama hatası")
