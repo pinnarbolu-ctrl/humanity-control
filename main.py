@@ -1,5 +1,5 @@
 """
-Humanity Assistant V3.1 - Railway Hazır Tek Coin Akıllı Takip
+Humanity Assistant V3.3 - Gözlem ve Tekrarsız AL Sürümü
 
 Amaç
 -----
@@ -13,8 +13,7 @@ Control deneyimlerinden alınan en faydalı parçaları tek coin için birleşti
 - Hacim ve momentum güçlenmesi ayrı ayrı izlenir.
 - EMA / RSI / MACD ana trend ve teyit katmanıdır.
 - Aşırı ısınmış hareketleri cezalandırır; geç giriş riskini işaretler.
-- Aynı uyarıyı tekrar tekrar göndermez; sadece seviye yükselmesi veya anlamlı
-  yeni güçlenmede haber verir.
+- Aynı uyarıyı tekrar tekrar göndermez; sadece seviye yükselmesi veya anlamlı\n  yeni güçlenmede haber verir.\n- BUY/AL tekrar filtresi TelegramNotifier hafızasından ayrılmıştır.\n- Eşikler değiştirilmeden her tarama gözlem günlüğüne kaydedilir.
 - Durumu JSON'da tutar, yeniden deploy/restart sonrası hafızasını korur.
 
 Not: Bu dosya mevcut proje modüllerini değiştirmez. HumanityTracker,
@@ -70,7 +69,14 @@ def validate_telegram_config():
 SCAN_INTERVAL_SECONDS = 60
 TECH_REFRESH_SECONDS = 15 * 60  # 200 adet 1h mum 15 dakikada bir yenilenir
 STATE_FILE = "humanity_assistant_state.json"
-LAST_SIGNAL_FILE = "last_signal.json"
+# ÖNEMLİ: telegram_notifier.py de last_signal.json kullanıyor.
+# Aynı dosyanın iki ayrı tekrar filtresi tarafından kullanılması BUY mesajını
+# her dakika yeniden "yeni" gibi gösterebiliyordu. Bu nedenle main kendi
+# AL geçiş hafızasını tamamen ayrı dosyada tutar.
+BUY_STATE_FILE = "humanity_buy_state.json"
+
+# Her 60 sn taramanın hareket öncesi verisini saklayan gözlem günlüğü.
+OBSERVATION_FILE = "humanity_observation_log.jsonl"
 
 # Yaklaşık 4 saatlik 1 dakikalık snapshot hafızası.
 MAX_HISTORY = 240
@@ -158,17 +164,33 @@ def _now_ts():
     return int(time.time())
 
 
+def _append_observation(record):
+    """Her taramanın kısa vadeli hareket verisini JSONL olarak sakla."""
+    try:
+        with open(OBSERVATION_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logging.exception("Gözlem günlüğü yazılamadı.")
+
+
 # -----------------------------------------------------------------------------
 # AL mesaj kontrolü: WAIT/SAT sessiz, yalnızca yeni AL Telegram'a gider.
 # -----------------------------------------------------------------------------
 
 def should_send_buy_signal(signal_result):
-    last = _load_json(LAST_SIGNAL_FILE, {})
+    """
+    Yalnızca BUY/AL durumuna GEÇİŞTE bir kez True döner.
+
+    telegram_notifier.py kendi last_signal.json dosyasını kullandığı için
+    burada AYRI humanity_buy_state.json kullanılır. Böylece iki tekrar filtresi
+    birbirinin hafızasını bozamaz ve BUY her dakika yeniden gönderilmez.
+    """
+    last = _load_json(BUY_STATE_FILE, {})
     current = str(signal_result.get("signal") or "").strip().upper()
     previous = str(last.get("signal") or "").strip().upper()
 
     _save_json(
-        LAST_SIGNAL_FILE,
+        BUY_STATE_FILE,
         {
             "signal": current,
             "score": signal_result.get("score"),
@@ -176,8 +198,9 @@ def should_send_buy_signal(signal_result):
         },
     )
 
-    # Kullanıcı tercihi: WAIT/BEKLE ve SAT/PAS arka planda kalır.
-    return current in {"BUY", "AL"} and current != previous
+    # WAIT/BEKLE/SAT/PAS sessizdir.
+    # BUY devam ettiği sürece sadece ilk geçişte mesaj gider.
+    return current in {"BUY", "AL"} and previous not in {"BUY", "AL"}
 
 
 # -----------------------------------------------------------------------------
@@ -683,13 +706,43 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
     )
 
     logging.info(
-        "H/TRY %s | assistant %.1f | %s | m1=%s m3=%s hacim=%s",
+        "H/TRY %s | assistant %.1f | %s | engine=%s | "
+        "m1=%s m3=%s m5=%s m15=%s | hacim=%s | teyit=%s",
         market_data.get("price"),
         analysis["score"],
         analysis["level"],
+        signal_result.get("score"),
         _fmt_pct(analysis["momentum"].get("m1")),
         _fmt_pct(analysis["momentum"].get("m3")),
+        _fmt_pct(analysis["momentum"].get("m5")),
+        _fmt_pct(analysis["momentum"].get("m15")),
         _fmt_num(analysis.get("volume_ratio")),
+        analysis.get("confirmation_count"),
+    )
+
+    # Eşikleri değiştirmeden gerçek hareket örneklerini biriktir.
+    _append_observation(
+        {
+            "ts": _now_ts(),
+            "iso": datetime.now(timezone.utc).isoformat(),
+            "price": _to_float(market_data.get("price")),
+            "change_24h": _to_float(market_data.get("change_24h")),
+            "assistant_score": analysis["score"],
+            "entry_quality": analysis["entry_quality"],
+            "level": analysis["level"],
+            "engine_signal": signal_result.get("signal"),
+            "engine_score": signal_result.get("score"),
+            "m1": analysis["momentum"].get("m1"),
+            "m3": analysis["momentum"].get("m3"),
+            "m5": analysis["momentum"].get("m5"),
+            "m15": analysis["momentum"].get("m15"),
+            "volume_ratio": analysis.get("volume_ratio"),
+            "volume_strengthening": analysis.get("volume_strengthening"),
+            "acceleration": analysis.get("acceleration"),
+            "confirmation_count": analysis.get("confirmation_count"),
+            "reasons": analysis.get("reasons", []),
+            "warnings": analysis.get("warnings", []),
+        }
     )
 
     # 1) Nihai karar: yalnızca YENİ AL Telegram'a gider.
@@ -732,7 +785,7 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
 
 
 def main():
-    logging.info("Humanity Assistant V3.2 başlatılıyor | tarama: %ss | 1h trend yenileme: %ss", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS)
+    logging.info("Humanity Assistant V3.3 GÖZLEM başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
 
     # Telegram ayarı yoksa bot sessizce çalışmasın; deploy logunda net hata versin.
     validate_telegram_config()
