@@ -1,5 +1,5 @@
 """
-Humanity Assistant V3.4 - Mikro Aday + Gözlem Sürümü
+Humanity Assistant V3.5 - Assistant Kontrollü AL Sürümü
 
 Amaç
 -----
@@ -7,7 +7,7 @@ H/TRY'yi 60 saniyede bir izler. Coin Radar, AI Coin Assistant ve Humanity
 Control deneyimlerinden alınan en faydalı parçaları tek coin için birleştirir:
 
 - WAIT/BEKLE sessizdir.
-- Telegram'a nihai karar olarak yalnızca yeni AL sinyali gönderilir.
+- Nihai AL kararının sahibi Assistant'tır; eski SignalEngine yalnızca teyit katmanıdır.
 - Erken hareketi 1m / 3m / 5m / 15m fiyat ivmesinden yakalar.
 - Hacim tek başına yeterli değildir; momentum eşleşmesi aranır.
 - Hacim ve momentum güçlenmesi ayrı ayrı izlenir.
@@ -183,30 +183,105 @@ def _append_observation(record):
 # AL mesaj kontrolü: WAIT/SAT sessiz, yalnızca yeni AL Telegram'a gider.
 # -----------------------------------------------------------------------------
 
-def should_send_buy_signal(signal_result):
+def should_send_assistant_buy(analysis):
     """
-    Yalnızca BUY/AL durumuna GEÇİŞTE bir kez True döner.
+    Nihai AL kararını Assistant verir.
 
-    telegram_notifier.py kendi last_signal.json dosyasını kullandığı için
-    burada AYRI humanity_buy_state.json kullanılır. Böylece iki tekrar filtresi
-    birbirinin hafızasını bozamaz ve BUY her dakika yeniden gönderilmez.
+    Şart:
+      - level == AL_ONCESI_GUCLU
+      - yani mevcut kurala göre Assistant >= 82,
+        en az 5 teyit ve pozitif momentum.
+
+    Tekrar koruması:
+      - Aynı güçlü hareket boyunca yalnızca 1 AL gönderilir.
+      - Sistem ancak 10 ardışık tarama boyunca ERKEN_ADAY altına dönerse
+        yeni bir AL döngüsüne hazırlanır.
     """
-    last = _load_json(BUY_STATE_FILE, {})
-    current = str(signal_result.get("signal") or "").strip().upper()
-    previous = str(last.get("signal") or "").strip().upper()
+    state = _load_json(BUY_STATE_FILE, {})
+    active = bool(state.get("assistant_buy_active", False))
+    calm_streak = int(state.get("calm_streak", 0) or 0)
+
+    level = analysis.get("level", "IZLEME")
+    rank = LEVEL_RANK.get(level, 0)
+    early_rank = LEVEL_RANK.get("ERKEN_ADAY", 2)
+    is_buy = level == "AL_ONCESI_GUCLU"
+
+    if is_buy:
+        should_send = not active
+        _save_json(
+            BUY_STATE_FILE,
+            {
+                "assistant_buy_active": True,
+                "calm_streak": 0,
+                "last_level": level,
+                "last_score": analysis.get("score"),
+                "last_buy_ts": _now_ts() if should_send else state.get("last_buy_ts"),
+                "updated_at": _now_ts(),
+            },
+        )
+        return should_send
+
+    # Güçlü hareketin kısa süreli dalgalanmasında AL kilidini hemen açma.
+    if rank < early_rank:
+        calm_streak += 1
+    else:
+        calm_streak = 0
+
+    if active and calm_streak >= 10:
+        active = False
 
     _save_json(
         BUY_STATE_FILE,
         {
-            "signal": current,
-            "score": signal_result.get("score"),
+            "assistant_buy_active": active,
+            "calm_streak": calm_streak,
+            "last_level": level,
+            "last_score": analysis.get("score"),
+            "last_buy_ts": state.get("last_buy_ts"),
             "updated_at": _now_ts(),
         },
     )
+    return False
 
-    # WAIT/BEKLE/SAT/PAS sessizdir.
-    # BUY devam ettiği sürece sadece ilk geçişte mesaj gider.
-    return current in {"BUY", "AL"} and previous not in {"BUY", "AL"}
+
+def format_assistant_buy_message(market_data, technical_result, signal_result, analysis):
+    """Assistant'ın nihai AL mesajı."""
+    m = analysis.get("momentum", {}) or {}
+    engine_signal = str(signal_result.get("signal") or "—").upper()
+    engine_score = signal_result.get("score")
+
+    lines = [
+        "🟢 H/TRY AL",
+        f"💰 Fiyat: {_fmt_num(market_data.get('price'))} TRY",
+        (
+            "⚡ Momentum: "
+            f"1dk {_fmt_pct(m.get('m1'))} • "
+            f"3dk {_fmt_pct(m.get('m3'))} • "
+            f"5dk {_fmt_pct(m.get('m5'))}"
+        ),
+        f"📊 Hacim: {_fmt_num(analysis.get('volume_ratio'))}x",
+    ]
+
+    if analysis.get("micro_staircase"):
+        lines.append(
+            f"🪜 Mikro basamak ✅ • 4 taramada %{analysis.get('micro_stair_move', 0):+.2f}"
+        )
+
+    rsi = analysis.get("rsi")
+    if rsi is not None:
+        lines.append(f"📉 RSI: {rsi:.1f}")
+
+    lines.append(
+        f"🎯 Assistant: {analysis.get('score', 0):.0f}/100"
+        f" • Teyit: {analysis.get('confirmation_count', 0)}"
+    )
+    lines.append(
+        f"🧠 Eski motor teyidi: {engine_signal}"
+        + (f" • {engine_score}/100" if engine_score is not None else "")
+    )
+    lines.append("✅ Nihai karar: AL — Assistant güçlü giriş şartlarını tamamladı.")
+
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------
@@ -598,7 +673,7 @@ LEVEL_TITLE = {
     "MIKRO_ADAY": "🔎 H/TRY MİKRO ADAY",
     "ERKEN_ADAY": "👀 H/TRY ERKEN ADAY",
     "GUCLENEN_ADAY": "🚀 H/TRY GÜÇLENEN ADAY",
-    "AL_ONCESI_GUCLU": "🔥 H/TRY AL ÖNCESİ GÜÇLÜ TAKİP",
+    "AL_ONCESI_GUCLU": "🟢 H/TRY AL",
 }
 
 
@@ -835,25 +910,38 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
         }
     )
 
-    # 1) Nihai karar: yalnızca YENİ AL Telegram'a gider.
-    if should_send_buy_signal(signal_result):
-        telegram_message = telegram_notifier.format_signal_message(
-            market_data,
-            technical_result,
-            signal_result,
-        )
-        sent = telegram_notifier.send_message(telegram_message)
-        logging.info("AL Telegram sonucu: %s", "Başarılı" if sent else "Gönderilmedi")
+    # 1) Nihai AL kararının sahibi artık Assistant.
+    # Mevcut eşikler değişmedi:
+    # Assistant >= 82 + en az 5 teyit + pozitif momentum => AL.
+    if analysis.get("level") == "AL_ONCESI_GUCLU":
+        if should_send_assistant_buy(analysis):
+            telegram_message = format_assistant_buy_message(
+                market_data,
+                technical_result,
+                signal_result,
+                analysis,
+            )
+            sent = telegram_notifier.send_message(telegram_message)
+            logging.info(
+                "ASSISTANT AL Telegram sonucu: %s | assistant=%.1f | engine=%s",
+                "Başarılı" if sent else "Gönderilmedi",
+                analysis.get("score", 0),
+                signal_result.get("signal"),
+            )
 
-        # AL geldiyse assistant seviye hafızasını güncelle; hemen ardından aynı aday
-        # mesajını göndermesin.
-        if sent:
-            state["last_alert_level"] = "AL_ONCESI_GUCLU"
-            state["last_alert_ts"] = _now_ts()
-            state["last_alert_volume"] = analysis.get("volume_ratio")
-            state["last_alert_m3"] = analysis["momentum"].get("m3")
+            if sent:
+                state["last_alert_level"] = "AL_ONCESI_GUCLU"
+                state["last_alert_ts"] = _now_ts()
+                state["last_alert_volume"] = analysis.get("volume_ratio")
+                state["last_alert_m3"] = analysis["momentum"].get("m3")
+        else:
+            # Aynı hareket içindeki AL tekrarlarını sessizce bastır.
+            logging.info(
+                "Assistant AL şartları devam ediyor; tekrar mesaj bastırıldı."
+            )
     else:
-        # WAIT/BEKLE/SAT/PAS için Telegram yok.
+        # Assistant henüz nihai AL seviyesinde değilse erken aday katmanları çalışır.
+        should_send_assistant_buy(analysis)  # reset/calm-streak hafızasını güncelle
         state = process_assistant_alert(
             state,
             market_data,
@@ -875,7 +963,7 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
 
 
 def main():
-    logging.info("Humanity Assistant V3.4 MİKRO ADAY başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | ana eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
+    logging.info("Humanity Assistant V3.5 ASSISTANT-AL başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
 
     # Telegram ayarı yoksa bot sessizce çalışmasın; deploy logunda net hata versin.
     validate_telegram_config()
