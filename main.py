@@ -1,5 +1,5 @@
 """
-Humanity Assistant V3.5 - Assistant Kontrollü AL Sürümü
+Humanity Assistant V3.7 - Hazırlık + Tek Mesaj Döngüsü
 
 Amaç
 -----
@@ -92,6 +92,11 @@ MICRO_M1_MIN = 0.30
 MICRO_M3_MIN = 0.20
 MICRO_STAIR_TOTAL_MIN = 0.25
 
+# HAZIRLIK / ÖN ADAY
+PREP_MAX_M1 = 0.30
+PREP_MAX_M3 = 0.70
+PREP_RESET_SCANS = 12
+
 # Aynı kategoride gereksiz Telegram tekrarını engeller.
 ALERT_COOLDOWN_SECONDS = 12 * 60
 VOLUME_RENOTIFY_MULTIPLIER = 1.35
@@ -152,6 +157,81 @@ def _negative_text(value):
     return any(word in text for word in words)
 
 
+def _radar_style_gate(market_data, technical_result, analysis):
+    """
+    Radar AL'dan Humanity'ye taşınan kalite kapısı.
+
+    Taşınanlar:
+      - EMA20 > EMA50 ve fiyat > EMA20
+      - RSI 48-75
+      - MACD pozitif
+      - Assistant güçlü skor + kısa momentum
+
+    ADX burada zorunlu kapı yapılmadı:
+    mevcut Humanity TechnicalAnalysis çıktısında ADX yok ve tek coin botunda
+    erkenliği gereksiz geciktirmemek için, eklenirse önce gözlem/bonus olarak kullanılmalı.
+
+    Hızlı H hareketleri için Radar'daki Yıldız istisnasına benzer bir
+    "güçlü momentum istisnası" vardır; EMA henüz yetişmemişse bile yalnızca
+    çok güçlü ve çok teyitli harekette AL'a izin verir.
+    """
+    price = _to_float(market_data.get("price"))
+    ema = (technical_result or {}).get("ema", {}) or {}
+    ema20 = _to_float(ema.get("ema_20"))
+    ema50 = _to_float(ema.get("ema_50"))
+    rsi = _to_float((technical_result or {}).get("rsi"))
+    macd_positive = _positive_text((technical_result or {}).get("macd_trend"))
+
+    m = analysis.get("momentum", {}) or {}
+    m1 = _to_float(m.get("m1"))
+    m3 = _to_float(m.get("m3"))
+    m5 = _to_float(m.get("m5"))
+    score = _to_float(analysis.get("score"), 0.0) or 0.0
+    confirmations = int(analysis.get("confirmation_count", 0) or 0)
+
+    ema_up = (
+        price is not None
+        and ema20 is not None
+        and ema50 is not None
+        and ema20 > ema50
+        and price > ema20
+    )
+    rsi_clean = rsi is not None and 48 <= rsi <= 75
+
+    normal_gate = (
+        score >= VERY_STRONG_SCORE
+        and confirmations >= 5
+        and ema_up
+        and rsi_clean
+        and macd_positive
+        and m3 is not None and m3 > 0
+    )
+
+    # H'ye özel hızlı devam istisnası:
+    # EMA 1 saatlik olduğu için hareketin ilk dakikalarında gecikebilir.
+    # Bu yol daha yüksek kalite ister; sıradan hareketlerde EMA kapısı delinmez.
+    momentum_exception = (
+        score >= 90
+        and confirmations >= 5
+        and rsi_clean
+        and macd_positive
+        and m1 is not None and m1 >= 0.60
+        and m3 is not None and m3 >= 1.20
+        and m5 is not None and 1.0 <= m5 <= 4.5
+    )
+
+    return {
+        "passed": bool(normal_gate or momentum_exception),
+        "normal_gate": bool(normal_gate),
+        "momentum_exception": bool(momentum_exception),
+        "ema_up": bool(ema_up),
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi_clean": bool(rsi_clean),
+        "macd_positive": bool(macd_positive),
+    }
+
+
 def _pct_change(current, old):
     if current is None or old in (None, 0):
         return None
@@ -183,14 +263,16 @@ def _append_observation(record):
 # AL mesaj kontrolü: WAIT/SAT sessiz, yalnızca yeni AL Telegram'a gider.
 # -----------------------------------------------------------------------------
 
-def should_send_assistant_buy(analysis):
+def should_send_assistant_buy(analysis, radar_gate):
     """
     Nihai AL kararını Assistant verir.
 
     Şart:
       - level == AL_ONCESI_GUCLU
-      - yani mevcut kurala göre Assistant >= 82,
-        en az 5 teyit ve pozitif momentum.
+      - Assistant >= 82 + en az 5 teyit + pozitif momentum
+      - Radar AL kalite kapısı:
+        EMA20>EMA50 & fiyat>EMA20 + RSI 48-75 + MACD pozitif
+      - veya H'ye özel çok güçlü momentum istisnası.
 
     Tekrar koruması:
       - Aynı güçlü hareket boyunca yalnızca 1 AL gönderilir.
@@ -204,7 +286,7 @@ def should_send_assistant_buy(analysis):
     level = analysis.get("level", "IZLEME")
     rank = LEVEL_RANK.get(level, 0)
     early_rank = LEVEL_RANK.get("ERKEN_ADAY", 2)
-    is_buy = level == "AL_ONCESI_GUCLU"
+    is_buy = level == "AL_ONCESI_GUCLU" and bool(radar_gate.get("passed"))
 
     if is_buy:
         should_send = not active
@@ -262,6 +344,14 @@ def format_assistant_buy_message(market_data, technical_result, signal_result, a
         f"📊 Hacim: {_fmt_num(analysis.get('volume_ratio'))}x",
     ]
 
+    if analysis.get("level") == "HAZIRLIK":
+        prep_reasons = analysis.get("prep_reasons", [])
+        if prep_reasons:
+            lines.append("🧩 Hazırlık: " + " • ".join(prep_reasons[:3]))
+        cm = analysis.get("prep_compression_move")
+        if cm is not None:
+            lines.append(f"🧱 Fiyat henüz gitmedi • 4 tarama hareketi %{cm:.2f}")
+
     if analysis.get("micro_staircase"):
         lines.append(
             f"🪜 Mikro basamak ✅ • 4 taramada %{analysis.get('micro_stair_move', 0):+.2f}"
@@ -275,11 +365,17 @@ def format_assistant_buy_message(market_data, technical_result, signal_result, a
         f"🎯 Assistant: {analysis.get('score', 0):.0f}/100"
         f" • Teyit: {analysis.get('confirmation_count', 0)}"
     )
+    radar_gate = _radar_style_gate(market_data, technical_result, analysis)
+    if radar_gate.get("normal_gate"):
+        lines.append("🛡️ Radar AL kalite kapısı ✅")
+    elif radar_gate.get("momentum_exception"):
+        lines.append("⚡ Hızlı momentum istisnası ✅")
+
     lines.append(
         f"🧠 Eski motor teyidi: {engine_signal}"
         + (f" • {engine_score}/100" if engine_score is not None else "")
     )
-    lines.append("✅ Nihai karar: AL — Assistant güçlü giriş şartlarını tamamladı.")
+    lines.append("✅ Nihai karar: AL — Assistant + kalite kapısı ortak onay verdi.")
 
     return "\n".join(lines)
 
@@ -376,6 +472,59 @@ def _micro_staircase(history):
     return staircase, total_move, positive_steps
 
 
+def _preparation_signal(history, current, previous, technical_result):
+    """Fiyat güçlü gitmeden önce hacim/RSI/MACD hazırlığını arar."""
+    price = _to_float(current.get("price"))
+    rsi = _to_float(current.get("rsi"))
+    prev_rsi = _to_float(previous.get("rsi"))
+    volume = _to_float(current.get("volume_ratio"))
+    prev_volume = _to_float(previous.get("volume_ratio"))
+    macd_hist = _to_float(current.get("macd_hist"))
+    prev_macd_hist = _to_float(previous.get("macd_hist"))
+
+    momentum = _price_momentum(history, price)
+    m1, m3 = momentum.get("m1"), momentum.get("m3")
+
+    ema_trend = ((technical_result or {}).get("ema") or {}).get("trend")
+    macd_trend = (technical_result or {}).get("macd_trend")
+    ema_ok = _positive_text(ema_trend) or not _negative_text(ema_trend)
+    macd_ok = _positive_text(macd_trend) or not _negative_text(macd_trend)
+
+    compression_move = None
+    if len(history) >= 4:
+        p0 = _to_float(history[-4].get("price"))
+        p1 = _to_float(history[-1].get("price"))
+        if p0 not in (None, 0) and p1 is not None:
+            compression_move = abs(((p1 / p0) - 1.0) * 100.0)
+
+    volume_rising = volume is not None and prev_volume not in (None, 0) and volume >= prev_volume * 1.15
+    recent_volumes = [_to_float(x.get("volume_ratio")) for x in history[-4:] if _to_float(x.get("volume_ratio")) is not None]
+    stepped_volume = len(recent_volumes) >= 3 and recent_volumes[-1] >= recent_volumes[-2] >= recent_volumes[-3] and recent_volumes[-1] >= recent_volumes[-3] * 1.20
+    rsi_rising = rsi is not None and prev_rsi is not None and 45 <= rsi <= 72 and rsi >= prev_rsi + 0.5
+    macd_improving = macd_hist is not None and prev_macd_hist is not None and macd_hist > prev_macd_hist
+    price_not_gone = (m1 is None or m1 <= PREP_MAX_M1) and (m3 is None or m3 <= PREP_MAX_M3) and (compression_move is None or compression_move <= 0.80)
+    no_sharp_drop = (m1 is None or m1 > -0.45) and (m3 is None or m3 > -0.80)
+
+    prep_points = 0
+    reasons = []
+    if volume_rising or stepped_volume:
+        prep_points += 2; reasons.append("hacim birikiyor")
+    if rsi_rising:
+        prep_points += 1; reasons.append("RSI yukarı kıvrılıyor")
+    if macd_improving:
+        prep_points += 1; reasons.append("MACD güçleniyor")
+    if ema_ok: prep_points += 1
+    if macd_ok: prep_points += 1
+
+    preparation = len(history) >= 4 and price_not_gone and no_sharp_drop and (volume_rising or stepped_volume) and prep_points >= 4
+    return {
+        "preparation": bool(preparation), "prep_points": prep_points, "prep_reasons": reasons,
+        "volume_rising": bool(volume_rising or stepped_volume), "rsi_rising": bool(rsi_rising),
+        "macd_improving": bool(macd_improving), "price_not_gone": bool(price_not_gone),
+        "compression_move": compression_move,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Tek coin Assistant skoru
 # -----------------------------------------------------------------------------
@@ -403,6 +552,7 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
     m15 = momentum.get("m15")
 
     micro_staircase, micro_stair_move, micro_positive_steps = _micro_staircase(history)
+    prep = _preparation_signal(history, current, previous, technical_result)
 
     ema_positive = _positive_text(current.get("ema_trend"))
     macd_positive = _positive_text(current.get("macd_trend")) or (
@@ -605,6 +755,9 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
             reasons.append("mikro basamak oluşuyor")
         reasons.append("kısa momentum uyanıyor")
 
+    if prep.get("preparation"):
+        reasons.extend(prep.get("prep_reasons", []))
+
     # Mevcut 55/70/82 eşikleri aynen korunur.
     if not enough_history or volume_without_momentum:
         level = "IZLEME"
@@ -616,6 +769,8 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
         level = "ERKEN_ADAY"
     elif micro_candidate:
         level = "MIKRO_ADAY"
+    elif prep.get("preparation"):
+        level = "HAZIRLIK"
     else:
         level = "IZLEME"
 
@@ -639,6 +794,10 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
         "micro_staircase": micro_staircase,
         "micro_stair_move": round(micro_stair_move, 3),
         "micro_positive_steps": micro_positive_steps,
+        "preparation": prep.get("preparation"),
+        "prep_points": prep.get("prep_points"),
+        "prep_reasons": prep.get("prep_reasons", []),
+        "prep_compression_move": prep.get("compression_move"),
         "volume_ratio": volume_ratio,
         "prev_volume_ratio": prev_volume,
         "volume_strengthening": volume_strengthening,
@@ -663,13 +822,15 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
 
 LEVEL_RANK = {
     "IZLEME": 0,
-    "MIKRO_ADAY": 1,
-    "ERKEN_ADAY": 2,
-    "GUCLENEN_ADAY": 3,
-    "AL_ONCESI_GUCLU": 4,
+    "HAZIRLIK": 1,
+    "MIKRO_ADAY": 2,
+    "ERKEN_ADAY": 3,
+    "GUCLENEN_ADAY": 4,
+    "AL_ONCESI_GUCLU": 5,
 }
 
 LEVEL_TITLE = {
+    "HAZIRLIK": "🟡 H/TRY HAZIRLIK",
     "MIKRO_ADAY": "🔎 H/TRY MİKRO ADAY",
     "ERKEN_ADAY": "👀 H/TRY ERKEN ADAY",
     "GUCLENEN_ADAY": "🚀 H/TRY GÜÇLENEN ADAY",
@@ -678,46 +839,33 @@ LEVEL_TITLE = {
 
 
 def _should_send_assistant_alert(state, analysis):
+    """Aynı hareket döngüsünde yalnızca seviye yükselirse mesaj gönder."""
     level = analysis["level"]
+    rank = LEVEL_RANK.get(level, 0)
+    cycle_active = bool(state.get("alert_cycle_active", False))
+    highest_rank = int(state.get("alert_cycle_highest_rank", 0) or 0)
+    calm_scans = int(state.get("alert_cycle_calm_scans", 0) or 0)
+
     if level == "IZLEME":
-        return False, None
+        if cycle_active:
+            calm_scans += 1
+            state["alert_cycle_calm_scans"] = calm_scans
+            if calm_scans >= PREP_RESET_SCANS:
+                state["alert_cycle_active"] = False
+                state["alert_cycle_highest_rank"] = 0
+                state["alert_cycle_calm_scans"] = 0
+                state["last_alert_level"] = "IZLEME"
+        return False, "QUIET"
 
-    last_level = state.get("last_alert_level", "IZLEME")
-    last_ts = int(state.get("last_alert_ts") or 0)
-    last_volume = _to_float(state.get("last_alert_volume"))
-    last_m3 = _to_float(state.get("last_alert_m3"))
-
-    current_rank = LEVEL_RANK.get(level, 0)
-    last_rank = LEVEL_RANK.get(last_level, 0)
-
-    # En değerli bildirim: kategori yükselmesi.
-    if current_rank > last_rank:
+    state["alert_cycle_calm_scans"] = 0
+    if not cycle_active:
+        state["alert_cycle_active"] = True
+        state["alert_cycle_highest_rank"] = rank
+        return True, "NEW_CYCLE"
+    if rank > highest_rank:
+        state["alert_cycle_highest_rank"] = rank
         return True, "LEVEL_UP"
-
-    elapsed = _now_ts() - last_ts
-    m3 = analysis["momentum"].get("m3")
-    volume = analysis.get("volume_ratio")
-
-    meaningful_volume = (
-        analysis.get("volume_strengthening")
-        and volume is not None
-        and (
-            last_volume is None
-            or volume >= last_volume * VOLUME_RENOTIFY_MULTIPLIER
-        )
-    )
-
-    meaningful_momentum = (
-        m3 is not None
-        and last_m3 is not None
-        and m3 >= last_m3 + MOMENTUM_RENOTIFY_STEP
-    )
-
-    # Aynı seviyede ancak cooldown sonrası belirgin yeni güçlenme varsa tekrar haber ver.
-    if elapsed >= ALERT_COOLDOWN_SECONDS and (meaningful_volume or meaningful_momentum):
-        return True, "STRENGTHENING"
-
-    return False, None
+    return False, "SAME_CYCLE"
 
 
 def _build_assistant_message(market_data, analysis, reason):
@@ -778,7 +926,9 @@ def _build_assistant_message(market_data, analysis, reason):
     if analysis.get("warnings"):
         lines.append("⚠️ " + " • ".join(analysis["warnings"][:2]))
 
-    if analysis["level"] == "MIKRO_ADAY":
+    if analysis["level"] == "HAZIRLIK":
+        lines.append("ℹ️ Önden hazırlık işareti — fiyat henüz gitmedi, AL değil.")
+    elif analysis["level"] == "MIKRO_ADAY":
         lines.append("ℹ️ Çok erken takip — AL değil, hareket uyanışı.")
     elif reason == "LEVEL_UP":
         lines.append("ℹ️ Seviye yükseldi — henüz nihai AL değil.")
@@ -791,9 +941,8 @@ def _build_assistant_message(market_data, analysis, reason):
 def process_assistant_alert(state, market_data, analysis, telegram_notifier):
     should_send, reason = _should_send_assistant_alert(state, analysis)
 
-    # Adaylık sönerse seviye hafızasını sıfırla; yeniden doğarsa tekrar haber verilebilir.
+    # IZLEME döngüyü hemen sıfırlamaz; 12 sakin tarama gerekir.
     if analysis["level"] == "IZLEME":
-        state["last_alert_level"] = "IZLEME"
         return state
 
     if not should_send:
@@ -905,16 +1054,18 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
             "micro_staircase": analysis.get("micro_staircase"),
             "micro_stair_move": analysis.get("micro_stair_move"),
             "micro_positive_steps": analysis.get("micro_positive_steps"),
+            "radar_gate": _radar_style_gate(market_data, technical_result, analysis),
             "reasons": analysis.get("reasons", []),
             "warnings": analysis.get("warnings", []),
         }
     )
 
-    # 1) Nihai AL kararının sahibi artık Assistant.
-    # Mevcut eşikler değişmedi:
-    # Assistant >= 82 + en az 5 teyit + pozitif momentum => AL.
+    # 1) Nihai AL kararının sahibi Assistant.
+    # Radar AL'dan alınan kalite kapısı, son onay katmanı olarak kullanılır.
+    radar_gate = _radar_style_gate(market_data, technical_result, analysis)
+
     if analysis.get("level") == "AL_ONCESI_GUCLU":
-        if should_send_assistant_buy(analysis):
+        if should_send_assistant_buy(analysis, radar_gate):
             telegram_message = format_assistant_buy_message(
                 market_data,
                 technical_result,
@@ -935,13 +1086,24 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
                 state["last_alert_volume"] = analysis.get("volume_ratio")
                 state["last_alert_m3"] = analysis["momentum"].get("m3")
         else:
-            # Aynı hareket içindeki AL tekrarlarını sessizce bastır.
-            logging.info(
-                "Assistant AL şartları devam ediyor; tekrar mesaj bastırıldı."
-            )
+            # Burada iki ihtimal vardır: kalite kapısı henüz geçmedi veya
+            # aynı hareket için AL daha önce gönderildi.
+            if not radar_gate.get("passed"):
+                logging.info(
+                    "Assistant güçlü fakat Radar kalite kapısı bekliyor | "
+                    "EMA=%s RSI=%s MACD=%s | momentum_exception=%s",
+                    radar_gate.get("ema_up"),
+                    radar_gate.get("rsi_clean"),
+                    radar_gate.get("macd_positive"),
+                    radar_gate.get("momentum_exception"),
+                )
+            else:
+                logging.info(
+                    "Assistant AL şartları devam ediyor; tekrar mesaj bastırıldı."
+                )
     else:
         # Assistant henüz nihai AL seviyesinde değilse erken aday katmanları çalışır.
-        should_send_assistant_buy(analysis)  # reset/calm-streak hafızasını güncelle
+        should_send_assistant_buy(analysis, radar_gate)  # reset/calm-streak hafızasını güncelle
         state = process_assistant_alert(
             state,
             market_data,
@@ -963,7 +1125,7 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
 
 
 def main():
-    logging.info("Humanity Assistant V3.5 ASSISTANT-AL başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
+    logging.info("Humanity Assistant V3.7 HAZIRLIK+SPAMFIX başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
 
     # Telegram ayarı yoksa bot sessizce çalışmasın; deploy logunda net hata versin.
     validate_telegram_config()
