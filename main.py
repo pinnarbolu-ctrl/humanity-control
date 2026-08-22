@@ -1,5 +1,5 @@
 """
-Humanity Assistant V3.7 - Hazırlık + Tek Mesaj Döngüsü
+Humanity Assistant V3.8 - Sıkı Hazırlık Filtresi
 
 Amaç
 -----
@@ -96,6 +96,12 @@ MICRO_STAIR_TOTAL_MIN = 0.25
 PREP_MAX_M1 = 0.30
 PREP_MAX_M3 = 0.70
 PREP_RESET_SCANS = 12
+PREP_MIN_SCORE = 34
+PREP_MIN_VOLUME_RATIO = 0.30
+PREP_MIN_CONFIRMATIONS = 3
+PREP_RSI_MIN = 48
+PREP_RSI_MAX = 70
+PREP_REQUIRED_STREAK = 2
 
 # Aynı kategoride gereksiz Telegram tekrarını engeller.
 ALERT_COOLDOWN_SECONDS = 12 * 60
@@ -347,7 +353,7 @@ def format_assistant_buy_message(market_data, technical_result, signal_result, a
     if analysis.get("level") == "HAZIRLIK":
         prep_reasons = analysis.get("prep_reasons", [])
         if prep_reasons:
-            lines.append("🧩 Hazırlık: " + " • ".join(prep_reasons[:3]))
+            lines.append(f"🧩 Hazırlık teyitleri ({analysis.get('prep_points', 0)}): " + " • ".join(prep_reasons[:4]))
         cm = analysis.get("prep_compression_move")
         if cm is not None:
             lines.append(f"🧱 Fiyat henüz gitmedi • 4 tarama hareketi %{cm:.2f}")
@@ -472,62 +478,78 @@ def _micro_staircase(history):
     return staircase, total_move, positive_steps
 
 
-def _preparation_signal(history, current, previous, technical_result):
-    """Fiyat güçlü gitmeden önce hacim/RSI/MACD hazırlığını arar."""
+def _preparation_signal(history, current, previous, technical_result, assistant_score=0):
+    """SIKI HAZIRLIK: tek bir veri sıçraması yeterli değildir."""
     price = _to_float(current.get("price"))
-    rsi = _to_float(current.get("rsi"))
-    prev_rsi = _to_float(previous.get("rsi"))
     volume = _to_float(current.get("volume_ratio"))
-    prev_volume = _to_float(previous.get("volume_ratio"))
-    macd_hist = _to_float(current.get("macd_hist"))
-    prev_macd_hist = _to_float(previous.get("macd_hist"))
-
     momentum = _price_momentum(history, price)
     m1, m3 = momentum.get("m1"), momentum.get("m3")
 
-    ema_trend = ((technical_result or {}).get("ema") or {}).get("trend")
+    recent = history[-4:]
+    vols = [_to_float(x.get("volume_ratio")) for x in recent]
+    rsis = [_to_float(x.get("rsi")) for x in recent]
+    macds = [_to_float(x.get("macd_hist")) for x in recent]
+    prices = [_to_float(x.get("price")) for x in recent]
+
+    volume_meaningful = volume is not None and volume >= PREP_MIN_VOLUME_RATIO
+    volume_streak = False
+    if len(vols) >= 3 and all(v is not None for v in vols[-3:]):
+        v0, v1, v2 = vols[-3:]
+        volume_streak = v0 > 0 and v1 >= v0 * 1.08 and v2 >= v1 * 1.08
+
+    rsi_streak = False
+    if len(rsis) >= 3 and all(v is not None for v in rsis[-3:]):
+        r0, r1, r2 = rsis[-3:]
+        rsi_streak = PREP_RSI_MIN <= r2 <= PREP_RSI_MAX and r1 >= r0 + 0.25 and r2 >= r1 + 0.25
+
     macd_trend = (technical_result or {}).get("macd_trend")
-    ema_ok = _positive_text(ema_trend) or not _negative_text(ema_trend)
-    macd_ok = _positive_text(macd_trend) or not _negative_text(macd_trend)
+    macd_positive = _positive_text(macd_trend)
+    macd_streak = False
+    if len(macds) >= 3 and all(v is not None for v in macds[-3:]):
+        h0, h1, h2 = macds[-3:]
+        macd_streak = h1 > h0 and h2 > h1
 
     compression_move = None
-    if len(history) >= 4:
-        p0 = _to_float(history[-4].get("price"))
-        p1 = _to_float(history[-1].get("price"))
-        if p0 not in (None, 0) and p1 is not None:
-            compression_move = abs(((p1 / p0) - 1.0) * 100.0)
+    price_structure_ok = False
+    if len(prices) >= 4 and all(p not in (None, 0) for p in prices):
+        p0, p1, p2, p3 = prices[-4:]
+        compression_move = abs(((p3 / p0) - 1.0) * 100.0)
+        price_structure_ok = compression_move <= 0.80 and p2 >= min(p0,p1)*0.997 and p3 >= min(p1,p2)*0.997
 
-    volume_rising = volume is not None and prev_volume not in (None, 0) and volume >= prev_volume * 1.15
-    recent_volumes = [_to_float(x.get("volume_ratio")) for x in history[-4:] if _to_float(x.get("volume_ratio")) is not None]
-    stepped_volume = len(recent_volumes) >= 3 and recent_volumes[-1] >= recent_volumes[-2] >= recent_volumes[-3] and recent_volumes[-1] >= recent_volumes[-3] * 1.20
-    rsi_rising = rsi is not None and prev_rsi is not None and 45 <= rsi <= 72 and rsi >= prev_rsi + 0.5
-    macd_improving = macd_hist is not None and prev_macd_hist is not None and macd_hist > prev_macd_hist
-    price_not_gone = (m1 is None or m1 <= PREP_MAX_M1) and (m3 is None or m3 <= PREP_MAX_M3) and (compression_move is None or compression_move <= 0.80)
-    no_sharp_drop = (m1 is None or m1 > -0.45) and (m3 is None or m3 > -0.80)
+    momentum_not_gone = ((m1 is None or -0.35 < m1 <= 0.30) and (m3 is None or -0.60 < m3 <= 0.70))
 
-    prep_points = 0
+    confirmations = 0
     reasons = []
-    if volume_rising or stepped_volume:
-        prep_points += 2; reasons.append("hacim birikiyor")
-    if rsi_rising:
-        prep_points += 1; reasons.append("RSI yukarı kıvrılıyor")
-    if macd_improving:
-        prep_points += 1; reasons.append("MACD güçleniyor")
-    if ema_ok: prep_points += 1
-    if macd_ok: prep_points += 1
+    if volume_meaningful and volume_streak:
+        confirmations += 1; reasons.append("hacim 2+ tarama güçleniyor")
+    if rsi_streak:
+        confirmations += 1; reasons.append("RSI düzenli yükseliyor")
+    if macd_streak or macd_positive:
+        confirmations += 1; reasons.append("MACD güçleniyor")
+    if price_structure_ok:
+        confirmations += 1; reasons.append("fiyat dar bantta tutunuyor")
 
-    preparation = len(history) >= 4 and price_not_gone and no_sharp_drop and (volume_rising or stepped_volume) and prep_points >= 4
+    preparation = (
+        len(history) >= 4
+        and float(assistant_score or 0) >= PREP_MIN_SCORE
+        and volume_meaningful
+        and volume_streak
+        and momentum_not_gone
+        and confirmations >= PREP_MIN_CONFIRMATIONS
+    )
     return {
-        "preparation": bool(preparation), "prep_points": prep_points, "prep_reasons": reasons,
-        "volume_rising": bool(volume_rising or stepped_volume), "rsi_rising": bool(rsi_rising),
-        "macd_improving": bool(macd_improving), "price_not_gone": bool(price_not_gone),
+        "preparation": bool(preparation),
+        "prep_points": confirmations,
+        "prep_reasons": reasons,
+        "volume_rising": bool(volume_meaningful and volume_streak),
+        "rsi_rising": bool(rsi_streak),
+        "macd_improving": bool(macd_streak or macd_positive),
+        "price_not_gone": bool(momentum_not_gone),
+        "price_structure_ok": bool(price_structure_ok),
         "compression_move": compression_move,
+        "volume_meaningful": bool(volume_meaningful),
     }
 
-
-# -----------------------------------------------------------------------------
-# Tek coin Assistant skoru
-# -----------------------------------------------------------------------------
 
 def build_assistant_analysis(state, market_data, technical_result, signal_result):
     history = state.get("history") or []
@@ -552,7 +574,6 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
     m15 = momentum.get("m15")
 
     micro_staircase, micro_stair_move, micro_positive_steps = _micro_staircase(history)
-    prep = _preparation_signal(history, current, previous, technical_result)
 
     ema_positive = _positive_text(current.get("ema_trend"))
     macd_positive = _positive_text(current.get("macd_trend")) or (
@@ -708,6 +729,8 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
 
     score = max(0.0, min(100.0, score))
 
+    prep = _preparation_signal(history, current, previous, technical_result, score)
+
     enough_history = m3 is not None
     positive_momentum = (
         (m1 is not None and m1 >= 0.20)
@@ -798,6 +821,7 @@ def build_assistant_analysis(state, market_data, technical_result, signal_result
         "prep_points": prep.get("prep_points"),
         "prep_reasons": prep.get("prep_reasons", []),
         "prep_compression_move": prep.get("compression_move"),
+        "prep_volume_meaningful": prep.get("volume_meaningful"),
         "volume_ratio": volume_ratio,
         "prev_volume_ratio": prev_volume,
         "volume_strengthening": volume_strengthening,
@@ -1125,7 +1149,7 @@ def run_scan(tracker, technical_analysis, signal_engine, telegram_notifier, tech
 
 
 def main():
-    logging.info("Humanity Assistant V3.7 HAZIRLIK+SPAMFIX başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
+    logging.info("Humanity Assistant V3.8 SIKI-HAZIRLIK başlatılıyor | tarama: %ss | 1h trend yenileme: %ss | eşikler: %s/%s/%s", SCAN_INTERVAL_SECONDS, TECH_REFRESH_SECONDS, EARLY_SCORE, STRONG_SCORE, VERY_STRONG_SCORE)
 
     # Telegram ayarı yoksa bot sessizce çalışmasın; deploy logunda net hata versin.
     validate_telegram_config()
