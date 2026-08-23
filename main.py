@@ -50,6 +50,53 @@ ILK_ZARAR_KES = -1.50        # İlk AL doğrulanmazsa yaklaşık -%1.5
 TEPE_GERI_VERME = -1.40      # Kâr alındıktan sonra tepeden %1.4 geri verme
 MIN_KAR_KORUMA = 2.50        # Trailing korumanın aktif sayıldığı minimum kâr
 
+# ==========================================
+# V13 ERKENLİK FİLTRESİ
+# Amaç: güçlü ama şişmiş coini AL diye kovalamamak.
+# 13'ün aday bulma yeteneği korunur; sadece giriş türü yeniden sınıflanır.
+# ==========================================
+ERKEN_1S_MAX = 3.00
+ERKEN_RSI_MAX = 70.0
+GEC_1S_ESIK = 3.50
+GEC_RSI_ESIK = 74.0
+GEC_1S_MUTLAK = 5.00
+GEC_3S_MUTLAK = 8.00
+
+def giris_zamanlamasi(aday):
+    teknik = aday.get("teknik") or {}
+    d1 = float(aday.get("degisim1", 0) or 0)
+    d3 = float(aday.get("degisim3", 0) or 0)
+    rsi = teknik.get("rsi")
+    try:
+        rsi = float(rsi) if rsi is not None else None
+    except Exception:
+        rsi = None
+
+    # Tek başına güçlü görünmek yeterli değil. Çoktan kaçmışsa yeni giriş yok.
+    gec = (
+        d1 >= GEC_1S_MUTLAK
+        or d3 >= GEC_3S_MUTLAK
+        or (d1 >= GEC_1S_ESIK and rsi is not None and rsi >= GEC_RSI_ESIK)
+    )
+    if gec:
+        return "GEC", "⛔ GEÇ / ALMA"
+
+    # Henüz şişmemiş, kısa güçlenme işaretleri olan sinyali öne çıkar.
+    erken = (
+        d1 <= ERKEN_1S_MAX
+        and (rsi is None or rsi <= ERKEN_RSI_MAX)
+        and (
+            aday.get("erken_aday")
+            or aday.get("hacim_hizlaniyor")
+            or aday.get("momentum_hizlaniyor")
+            or aday.get("basamakli_trend")
+        )
+    )
+    if erken:
+        return "ERKEN", "🌱 ERKEN AL"
+
+    return "DEVAM", "🟢 DEVAM AL"
+
 def _pct(simdi, baz):
     return ((simdi / baz) - 1.0) * 100.0 if baz else 0.0
 
@@ -1343,6 +1390,16 @@ while True:
                 if onceki_karar == karar:
                     continue
 
+                giris_turu, giris_etiketi = giris_zamanlamasi(a)
+
+                # Geç / şişmiş sinyaller Telegram'a hiç gönderilmez.
+                # Bunlar yeni pozisyon olarak da AL/SAT takibine alınmaz.
+                if giris_turu == "GEC":
+                    print(f"[AL DEBUG] {symbol} | geç giriş filtresi -> Telegram sessiz")
+                    continue
+
+                a["giris_turu"] = giris_turu
+                a["giris_etiketi"] = giris_etiketi
                 gonderilecekler.append(a)
 
             if not gonderilecekler:
@@ -1384,10 +1441,18 @@ while True:
                     neden_alarm = "🚨 🚨 " if toplam_neden_sayisi >= 6 else ""
                     neden = " • ".join(nedenler[:5])
 
+                    giris_etiketi = a.get("giris_etiketi", "🟢 DEVAM AL")
+                    gec_mi = a.get("giris_turu") == "GEC"
+                    plan_satiri = (
+                        "📌 Plan: YENİ GİRİŞ YOK — hareket fazla ilerlemiş\n"
+                        if gec_mi
+                        else f"📌 Plan: ilk giriş max %33 | Kâr Al 1: +%{KAR_AL_1_ESIK:.1f} | Zarar sınırı: %{ILK_ZARAR_KES:.1f}\n"
+                    )
+
                     mesaj += (
                         f"{a['symbol']} | {a.get('radar_kategori', '')}\n"
-                        f"{a.get('karar')} | AI Skoru: {a.get('ai_skoru', 0)}/100 | Risk: {a.get('risk', 'Bilinmiyor')}\n"
-                        f"📌 Plan: ilk giriş max %33 | Kâr Al 1: +%{KAR_AL_1_ESIK:.1f} | Zarar sınırı: %{ILK_ZARAR_KES:.1f}\n"
+                        f"{giris_etiketi} | AI Skoru: {a.get('ai_skoru', 0)}/100 | Risk: {a.get('risk', 'Bilinmiyor')}\n"
+                        f"{plan_satiri}"
                         f"Radar: {a['radar_skoru']}/100 | Fiyat: {round(a['fiyat'], 4)} | Hacim: {a['hacim']}x\n"
                         f"1s: %{a['degisim1']} | 3s: %{a['degisim3']} | 24s: %{a['degisim24']}\n"
                         f"EMA: {ema_yon} | RSI: {teknik['rsi']} | ADX: {teknik['adx']}\n"
@@ -1395,9 +1460,11 @@ while True:
                         f"{neden_alarm}Neden: {neden}\n\n"
                     )
 
-                # Telegram'a AL olarak çıkan her coini satış/kâr koruma takibine al.
+                # Yalnızca gerçekten yeni giriş yapılabilir sinyalleri AL/SAT takibine al.
+                # GEÇ / ALMA mesajı bilgi amaçlıdır; pozisyon açılmış sayılmaz.
                 for _aday in gonderilecekler:
-                    al_takip_baslat(_aday)
+                    if _aday.get("giris_turu") != "GEC":
+                        al_takip_baslat(_aday)
 
                 print(mesaj)
                 telegram_gonder(mesaj)
