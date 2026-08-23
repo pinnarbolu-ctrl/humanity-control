@@ -1,5 +1,5 @@
 # ==========================================
-# AI COIN ASSISTANT - V22 PARCALI AL/SAT KARSILASTIRMA
+# AI COIN ASSISTANT - V21D KISA VADE + KÂR KORUMA / SAT
 # Taban: main_20_coklu_guc_siklastirilmis.py
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
@@ -49,187 +49,145 @@ CANLI_MAX_KAZANAN = 2
 CANLI_MIN_YARIS_SKORU = 66
 BTC_SERT_ZAYIFLIK_ESIGI = -2.0
 
-
-
-
-
-
-
 # ==========================================
-# V22 - PARÇALI POZİSYON YÖNETİMİ (UYARI/SİMÜLASYON)
-# Emir göndermez. Ayrı bot/projede 21C ile aynı anda karşılaştırma için tasarlanmıştır.
-# 1. giriş %30 -> devam teyidi +%30 -> kırılım teyidi +%40 -> yapı bozulursa SAT/PAS.
+# V21D - AL SONRASI KÂR KORUMA / SAT TAKİBİ
+# 21C erken yakalama mantığı aynen korunur.
+# Emir göndermez; yalnızca karar mesajı üretir.
 # ==========================================
-POZISYON_DOSYASI = "v22_pozisyon_state.json"
-POZISYONLAR = {}
-ILK_GIRIS_ORANI = 30
-IKINCI_GIRIS_ORANI = 30
-UCUNCU_GIRIS_ORANI = 40
-MIN_2_GIRIS_BEKLEME = 60
-MIN_3_GIRIS_BEKLEME = 120
-ILK_STOP_YUZDE = -1.50
-KAR_KORUMA_BASLA = 2.50
-KAR_KORUMA_GERI_VERME = -1.40
+TAKIP_DOSYASI = "v21d_al_takip_state.json"
+AL_TAKIP = {}
+KAR_AL_1_ESIK = 3.0          # İlk girişe göre yaklaşık +%3'te kârın bir kısmını koru
+KAR_AL_1_ORAN = 40           # Önerilen ilk kâr alma oranı
+ILK_ZARAR_KES = -1.50        # İlk AL sonrası yapı bozulursa bekleme
+TEPE_GERI_VERME = -1.40      # Kâr oluştuğunda tepeden geri verme
+MIN_KAR_KORUMA = 2.50        # Trailing korumayı açmak için minimum kâr
 
-
-def _pozisyon_yukle():
-    global POZISYONLAR
+def _takip_yukle():
+    global AL_TAKIP
     try:
-        if os.path.exists(POZISYON_DOSYASI):
-            with open(POZISYON_DOSYASI, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    POZISYONLAR = data
+        if os.path.exists(TAKIP_DOSYASI):
+            with open(TAKIP_DOSYASI, "r", encoding="utf-8") as f:
+                x=json.load(f)
+                if isinstance(x, dict):
+                    AL_TAKIP=x
     except Exception as e:
-        print("[POZISYON] state okunamadı:", e)
-        POZISYONLAR = {}
+        print("[TAKIP] state okunamadı:", e)
+        AL_TAKIP={}
 
-
-def _pozisyon_kaydet():
+def _takip_kaydet():
     try:
-        tmp = POZISYON_DOSYASI + ".tmp"
+        tmp=TAKIP_DOSYASI+".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(POZISYONLAR, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, POZISYON_DOSYASI)
+            json.dump(AL_TAKIP, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TAKIP_DOSYASI)
     except Exception as e:
-        print("[POZISYON] state yazılamadı:", e)
+        print("[TAKIP] state yazılamadı:", e)
 
+def _pct(simdi, baz):
+    return ((simdi / baz) - 1.0) * 100.0 if baz else 0.0
 
-def _fiyat_yuzde(simdi, baz):
-    if not baz:
-        return 0.0
-    return ((simdi / baz) - 1.0) * 100.0
-
-
-def pozisyon_baslat(aday):
-    symbol = aday.get("symbol")
-    fiyat = float(aday.get("fiyat", 0) or 0)
-    if not symbol or fiyat <= 0:
-        return None
-    acik = POZISYONLAR.get(symbol)
-    if acik and acik.get("durum") == "ACIK":
-        return None
-    simdi = time.time()
-    POZISYONLAR[symbol] = {
-        "durum": "ACIK", "asama": 1, "ilk_zaman": simdi, "son_asama_zaman": simdi,
-        "giris1": fiyat, "giris2": None, "giris3": None,
-        "agirlik": ILK_GIRIS_ORANI, "max_fiyat": fiyat,
-        "ilk_yaris": aday.get("yaris_skoru", 0), "son_fiyat": fiyat
-    }
-    _pozisyon_kaydet()
-    return (
-        f"🟡 1. GİRİŞ - {symbol}\n"
-        f"Pozisyon: %{ILK_GIRIS_ORANI} | Fiyat: {fiyat:.4f}\n"
-        f"Yarış: #{aday.get('yaris_sirasi','?')} | Güç: {aday.get('yaris_skoru',0)}/100\n"
-        f"Kural: Kalan %{100-ILK_GIRIS_ORANI} henüz BEKLE\n"
-        f"Not: Uyarı/simülasyon; otomatik emir göndermez."
-    )
-
-
-def pozisyonlari_guncelle(ticker):
-    if not POZISYONLAR:
+def al_takip_baslat(aday):
+    symbol=aday.get("symbol")
+    fiyat=float(aday.get("fiyat",0) or 0)
+    if not symbol or fiyat<=0:
         return
-    fiyat_map = {}
+    eski=AL_TAKIP.get(symbol)
+    if eski and eski.get("durum")=="ACIK":
+        return
+    AL_TAKIP[symbol]={
+        "durum":"ACIK", "giris":fiyat, "max_fiyat":fiyat,
+        "ilk_zaman":time.time(), "kar_al1":False, "kalan_oran":100,
+        "son_fiyat":fiyat
+    }
+    _takip_kaydet()
+
+def al_takip_guncelle(ticker):
+    if not AL_TAKIP:
+        return
+    fiyatlar={}
     for coin in ticker:
         try:
-            sym = coin.get("pair", "")
-            f = float(coin.get("last", 0) or 0)
-            if sym and f > 0:
-                fiyat_map[sym] = f
+            sym=coin.get("pair","")
+            f=float(coin.get("last",0) or 0)
+            if sym and f>0:
+                fiyatlar[sym]=f
         except Exception:
             pass
-
-    simdi = time.time()
-    mesajlar = []
-    degisti = False
-    for symbol, p in list(POZISYONLAR.items()):
-        if p.get("durum") != "ACIK":
+    degisti=False
+    mesajlar=[]
+    for symbol,p in list(AL_TAKIP.items()):
+        if p.get("durum")!="ACIK":
             continue
-        fiyat = fiyat_map.get(symbol)
+        fiyat=fiyatlar.get(symbol)
         if not fiyat:
             continue
-        p["son_fiyat"] = fiyat
-        onceki_max = float(p.get("max_fiyat", fiyat) or fiyat)
-        if fiyat > onceki_max:
-            p["max_fiyat"] = fiyat
-        max_fiyat = float(p.get("max_fiyat", fiyat) or fiyat)
-        giris1 = float(p.get("giris1", fiyat) or fiyat)
-        getiri = _fiyat_yuzde(fiyat, giris1)
-        geri_verme = _fiyat_yuzde(fiyat, max_fiyat)
-        mikro = mikro_ivme_hesapla(symbol) or {}
-        d1 = float(mikro.get("d1", 0) or 0)
-        d3 = float(mikro.get("d3", 0) or 0)
-        d5 = float(mikro.get("d5", 0) or 0)
-        hacim1x = float(mikro.get("hacim1x", 0) or 0)
-        hivme = float(mikro.get("hacim3_ivme", 0) or 0)
-        basamak = bool(mikro.get("mikro_basamak"))
-        gecen = simdi - float(p.get("son_asama_zaman", simdi) or simdi)
-        asama = int(p.get("asama", 1) or 1)
+        giris=float(p.get("giris",fiyat) or fiyat)
+        eski_max=float(p.get("max_fiyat",fiyat) or fiyat)
+        if fiyat>eski_max:
+            p["max_fiyat"]=fiyat
+        tepe=float(p.get("max_fiyat",fiyat) or fiyat)
+        p["son_fiyat"]=fiyat
+        getiri=_pct(fiyat,giris)
+        geri=_pct(fiyat,tepe)
+        mikro=mikro_ivme_hesapla(symbol) or {}
+        d1=float(mikro.get("d1",0) or 0)
+        d3=float(mikro.get("d3",0) or 0)
+        d5=float(mikro.get("d5",0) or 0)
+        hacim1=float(mikro.get("hacim1x",0) or 0)
 
-        # Önce zarar/bozulma kontrolü. Kazanç başladıktan sonra tepe geri vermesi de korumaya alınır.
-        bozuldu = (getiri <= ILK_STOP_YUZDE) or (d3 <= -1.0 and d1 < 0) or (geri_verme <= -2.0)
-        kar_koruma = (getiri >= KAR_KORUMA_BASLA and geri_verme <= KAR_KORUMA_GERI_VERME)
-        if bozuldu or kar_koruma:
-            sebep = "kâr koruma / tepeden geri verme" if kar_koruma and not bozuldu else "kısa yapı bozuldu"
-            p["durum"] = "KAPALI"
-            p["kapanis"] = fiyat
-            p["kapanis_zaman"] = simdi
-            p["sonuc_yuzde"] = round(getiri, 2)
+        # İlk hedef: kârı tamamen kapatmak yerine bir kısmını kilitle.
+        if not p.get("kar_al1") and getiri >= KAR_AL_1_ESIK:
+            p["kar_al1"]=True
+            p["kalan_oran"]=100-KAR_AL_1_ORAN
             mesajlar.append(
-                f"🔴 SAT / ÇIKIŞ - {symbol}\n"
-                f"Fiyat: {fiyat:.4f} | İlk girişe göre: %{getiri:+.2f}\n"
-                f"Sebep: {sebep}\n"
-                f"Yeni ekleme yok; yeniden güçlenirse yeni aday olarak değerlendirilecek."
+                f"🟠 KÂR AL 1 - {symbol}\n"
+                f"Fiyat: {fiyat:.4f} | İlk AL'a göre: %{getiri:+.2f}\n"
+                f"Öneri: pozisyonun %{KAR_AL_1_ORAN}'ını koru, %{100-KAR_AL_1_ORAN}'ını taşı\n"
+                f"3dk: %{d3:+.2f} | 5dk: %{d5:+.2f} | Hacim: {hacim1:.2f}x\n"
+                f"Kural: kalan kısım trend bozulana kadar takipte."
             )
-            degisti = True
+            degisti=True
             continue
 
-        # 2. giriş: fiyat kendini doğruluyor, kısa momentum/hacim devam ediyor.
-        if asama == 1 and gecen >= MIN_2_GIRIS_BEKLEME:
-            devam = getiri >= 0.60 and d3 >= 0.35 and d5 >= 0.45
-            kalite = basamak or hacim1x >= 1.25 or hivme >= 1.15
-            if devam and kalite and not mikro.get("sisti"):
-                p["asama"] = 2
-                p["giris2"] = fiyat
-                p["agirlik"] = ILK_GIRIS_ORANI + IKINCI_GIRIS_ORANI
-                p["son_asama_zaman"] = simdi
-                mesajlar.append(
-                    f"🟢 2. GİRİŞ ONAYI - {symbol}\n"
-                    f"+%{IKINCI_GIRIS_ORANI} | Toplam pozisyon: %{p['agirlik']}\n"
-                    f"Fiyat: {fiyat:.4f} | İlk girişe göre: %{getiri:+.2f}\n"
-                    f"3dk: %{d3:+.2f} | 5dk: %{d5:+.2f} | Hacim: {hacim1x:.2f}x\n"
-                    f"Neden: geri çekilme bozulmadı, kısa devam teyidi geldi."
-                )
-                degisti = True
-                continue
+        # İlk kâr hedefinden önce yanlış sinyali büyütme.
+        ilk_bozulma = (not p.get("kar_al1")) and (getiri <= ILK_ZARAR_KES or (d3 <= -1.0 and d1 < 0))
 
-        # 3. giriş: önceki tepe yenilenirken momentum ve hacim hâlâ sağlıklı.
-        if asama == 2 and gecen >= MIN_3_GIRIS_BEKLEME:
-            yeni_tepe = fiyat >= onceki_max * 1.0015
-            devam = getiri >= 1.40 and d3 >= 0.50 and d5 >= 0.80
-            kalite = basamak or hacim1x >= 1.30 or hivme >= 1.20
-            if yeni_tepe and devam and kalite and not mikro.get("sisti"):
-                p["asama"] = 3
-                p["giris3"] = fiyat
-                p["agirlik"] = 100
-                p["son_asama_zaman"] = simdi
-                mesajlar.append(
-                    f"🚀 3. GİRİŞ ONAYI - {symbol}\n"
-                    f"+%{UCUNCU_GIRIS_ORANI} | Toplam pozisyon: %100\n"
-                    f"Fiyat: {fiyat:.4f} | İlk girişe göre: %{getiri:+.2f}\n"
-                    f"Neden: yeni kısa tepe + devam eden momentum/hacim."
-                )
-                degisti = True
-                continue
+        # Kâr alındıktan sonra kalan parçayı tepe geri vermesi / kısa yapı bozulmasıyla kapat.
+        karli_bozulma = p.get("kar_al1") and (
+            (getiri >= MIN_KAR_KORUMA and geri <= TEPE_GERI_VERME)
+            or (d3 <= -0.80 and d1 < 0)
+            or (d5 <= -1.20)
+        )
+
+        if ilk_bozulma or karli_bozulma:
+            p["durum"]="KAPALI"
+            p["kapanis"]=fiyat
+            p["kapanis_zaman"]=time.time()
+            p["sonuc_yuzde"]=round(getiri,2)
+            if p.get("kar_al1"):
+                baslik="🔴 SAT KALAN"
+                sebep="tepeden geri verme / kısa yapı bozuldu"
+            else:
+                baslik="🔴 AL İPTAL / ÇIK"
+                sebep="ilk AL doğrulanmadı; kısa yapı bozuldu"
+            mesajlar.append(
+                f"{baslik} - {symbol}\n"
+                f"Fiyat: {fiyat:.4f} | İlk AL'a göre: %{getiri:+.2f}\n"
+                f"Tepe: {tepe:.4f} | Tepeden: %{geri:+.2f}\n"
+                f"Sebep: {sebep}\n"
+                f"Yeniden güçlenirse yeni aday olarak tekrar değerlendirilebilir."
+            )
+            degisti=True
 
     if degisti:
-        _pozisyon_kaydet()
+        _takip_kaydet()
     for m in mesajlar:
         print(m)
         telegram_gonder(m)
 
+_takip_yukle()
 
-_pozisyon_yukle()
+
 
 STABLE_COINLER = [
     "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDP"
@@ -1247,7 +1205,7 @@ def canli_kazananlari_bul(btc_3s, simdi=None):
 while True:
     try:
         print()
-        print("AI COIN ASSISTANT - V22 PARCALI AL/SAT KARSILASTIRMA")
+        print("AI COIN ASSISTANT - V21D KISA VADE + KAR KORUMA / SAT")
         print("--------------------------------")
 
         btc_d = btc_degisimleri()
@@ -1268,8 +1226,8 @@ while True:
         ticker_response.raise_for_status()
         ticker = ticker_response.json().get("data", [])
 
-        # Açık simülasyon pozisyonlarını her 60 sn bağımsız güncelle.
-        pozisyonlari_guncelle(ticker)
+        # Daha önce AL verilmiş coinleri her 60 sn kâr/çıkış açısından bağımsız takip et.
+        al_takip_guncelle(ticker)
 
         adaylar = []
 
@@ -1849,13 +1807,12 @@ while True:
                         f"{neden_alarm}Neden: {neden}\n\n"
                     )
 
-                # V22 ayrı karşılaştırma botu: klasik AL mesajı yerine parçalı pozisyonun 1. adımını başlat.
-                print(mesaj)
+                # AL mesajına giren her coin için satış/kâr koruma takibini başlat.
                 for _aday in gonderilecekler:
-                    _giris_mesaji = pozisyon_baslat(_aday)
-                    if _giris_mesaji:
-                        print(_giris_mesaji)
-                        telegram_gonder(_giris_mesaji)
+                    al_takip_baslat(_aday)
+
+                print(mesaj)
+                telegram_gonder(mesaj)
 
         print("60 sn bekleniyor...")
         time.sleep(TARAMA_SURESI)
