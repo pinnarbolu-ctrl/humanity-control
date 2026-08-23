@@ -1,5 +1,5 @@
 # ==========================================
-# AI COIN ASSISTANT - V13 AL/SAT - TELEGRAM FIX
+# AI COIN ASSISTANT - V13 AL/SAT
 # Fast Scan V1: 60 sn hızlı ön tarama + 5 dk tam tarama
 # AL Relax V1: normal AL için ADX 27 / AI 80
 # Final Cleanup / Core Candidate Scanner
@@ -13,11 +13,12 @@ import requests
 import feedparser
 
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-CHAT_IDS = [
-    2097448038,
-]
+# Humanity Railway projesiyle aynı Telegram değişkenlerini kullanır.
+# Railway > Variables tarafında mevcut değerler otomatik okunur;
+# token/chat ID GitHub koduna yazılmaz.
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+CHAT_IDS = [TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else []
 
 TARAMA_SURESI = 60
 TAM_TARAMA_DONGUSU = 5          # 5 x 60 sn = yaklaşık 5 dk
@@ -33,10 +34,8 @@ onceki_tarama = {}
 guc_izleme_havuzu = {}
 GUC_IZLEME_SURESI = 5 * 60
 
-# Son görülen karar + başarıyla Telegram gönderilmiş AL hafızası.
-# AL ancak Telegram gönderimi başarılı olduktan sonra gönderilmiş sayılır.
+# Aynı kararın tekrar Telegram gönderimini engeller.
 son_ai_kararlar = {}
-al_telegram_gonderildi = set()
 
 # ==========================================
 # V13 AL/SAT - AL SONRASI POZİSYON TAKİBİ
@@ -215,13 +214,14 @@ NEGATIF = [
 
 
 def telegram_gonder(mesaj):
-    """Telegram'a gönderir; en az bir chat başarılıysa True döner."""
     if not BOT_TOKEN:
-        print("BOT_TOKEN bulunamadı. Railway Variables kontrol et.")
-        return False
+        print("TELEGRAM_BOT_TOKEN bulunamadı. Humanity Railway Variables kontrol et.")
+        return
+    if not CHAT_IDS:
+        print("TELEGRAM_CHAT_ID bulunamadı. Humanity Railway Variables kontrol et.")
+        return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    basarili = False
 
     for chat_id in CHAT_IDS:
         try:
@@ -231,17 +231,8 @@ def telegram_gonder(mesaj):
                 timeout=10
             )
             print(chat_id, r.text)
-            if r.ok:
-                try:
-                    cevap = r.json()
-                    if cevap.get("ok") is True:
-                        basarili = True
-                except Exception:
-                    pass
         except Exception as e:
             print(chat_id, e)
-
-    return basarili
 
 
 def veri_getir(symbol, saat=24):
@@ -1343,15 +1334,13 @@ while True:
                 onceki_karar = son_ai_kararlar.get(symbol)
                 son_ai_kararlar[symbol] = karar
 
-                # AL dışına çıktıysa gönderim kilidini aç. Böylece ileride yeniden AL olursa
-                # yeni bir sinyal olarak tekrar Telegram'a gönderilebilir.
+                # Telegram yalnızca gerçek AL kararlarında konuşur.
+                # BEKLE ve SAT/PAS arka planda/loglarda izlenmeye devam eder.
                 if "🟢 AL" not in karar:
-                    al_telegram_gonderildi.discard(symbol)
                     continue
 
-                # AL tespit edildi ama daha önce başarıyla Telegram'a gitmediyse MUTLAKA sıraya al.
-                # Önceki sürümde karar hafızaya Telegram'dan önce yazıldığı için mesaj kaçabiliyordu.
-                if symbol in al_telegram_gonderildi:
+                # Aynı AL kararını tekrar gönderme.
+                if onceki_karar == karar:
                     continue
 
                 gonderilecekler.append(a)
@@ -1411,16 +1400,7 @@ while True:
                     al_takip_baslat(_aday)
 
                 print(mesaj)
-                telegram_basarili = telegram_gonder(mesaj)
-
-                # Yalnızca Telegram gerçekten kabul ettiyse AL'leri gönderilmiş say.
-                # Gönderim başarısızsa bir sonraki 60 sn taramada yeniden denenecek.
-                if telegram_basarili:
-                    for _aday in gonderilecekler:
-                        al_telegram_gonderildi.add(_aday["symbol"])
-                    print("AL mesajı Telegram'a başarıyla gönderildi.")
-                else:
-                    print("AL bulundu fakat Telegram gönderimi başarısız. Sonraki taramada tekrar denenecek.")
+                telegram_gonder(mesaj)
 
         print("60 sn bekleniyor...")
         time.sleep(TARAMA_SURESI)
