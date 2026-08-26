@@ -17,8 +17,7 @@ import feedparser
 # Railway > Variables tarafında mevcut değerler otomatik okunur;
 # token/chat ID GitHub koduna yazılmaz.
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-CHAT_IDS = [TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else []
+CHAT_IDS = [2097448038]
 
 TARAMA_SURESI = 60
 TAM_TARAMA_DONGUSU = 5          # 5 x 60 sn = yaklaşık 5 dk
