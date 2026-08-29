@@ -16,7 +16,19 @@ HORIZONS=(15,30,60,180)
 MAIN_HORIZON=180
 
 
+def _metin_duzelt(msg):
+    # Railway/GitHub hattında oluşabilen UTF-8 -> Latin-1 mojibake bozulmasını düzelt.
+    if not isinstance(msg, str):
+        msg = str(msg)
+    if any(x in msg for x in ('Ã', 'Ä', 'Å', 'ð', 'Â')):
+        try:
+            msg = msg.encode('latin1').decode('utf-8')
+        except Exception:
+            pass
+    return msg
+
 def tg(msg):
+    msg = _metin_duzelt(msg)
     if not BOT_TOKEN:
         print('[TELEGRAM YOK]\n'+msg); return False
     ok=False
@@ -56,11 +68,13 @@ def setup():
     c.execute('create index if not exists ix_ss on snapshots(symbol,ts)')
     c.execute('''create table if not exists outcomes(
       snapshot_id integer,horizon integer,symbol text,ts integer,ret_end real,max_up real,max_down real,
-      hit4 integer,hit7 integer,hit10 integer,
+      hit4 integer,hit7 integer,hit10 integer,hit4_time integer,
       primary key(snapshot_id,horizon))''')
     cols=[r[1] for r in c.execute('pragma table_info(outcomes)').fetchall()]
     if 'hit10' not in cols:
         c.execute('alter table outcomes add column hit10 integer default 0')
+    if 'hit4_time' not in cols:
+        c.execute('alter table outcomes add column hit4_time integer')
     c.execute('create index if not exists ix_oh on outcomes(horizon,hit4,hit7,hit10)')
     if meta_get(c,'start_ts') is None: meta_set(c,'start_ts',int(time.time()))
     if meta_get(c,'last_daily') is None: meta_set(c,'last_daily','')
@@ -137,17 +151,32 @@ def insert_snap(c,ts,sym,vals):
 
 def label(c,h,batch=800):
     cutoff=int(time.time())-h*60-120
-    rows=c.execute('''select s.id,s.symbol,s.ts,s.price from snapshots s left join outcomes o on o.snapshot_id=s.id and o.horizon=? where s.ts<=? and o.snapshot_id is null order by s.ts limit ?''',(h,cutoff,batch)).fetchall()
+    rows=c.execute("""select s.id,s.symbol,s.ts,s.price from snapshots s
+                      left join outcomes o on o.snapshot_id=s.id and o.horizon=?
+                      where s.ts<=? and o.snapshot_id is null
+                      order by s.ts limit ?""",(h,cutoff,batch)).fetchall()
     n=0
     for sid,sym,ts,entry in rows:
-        fut=[r[0] for r in c.execute('select price from snapshots where symbol=? and ts>? and ts<=? order by ts',(sym,ts,ts+h*60)).fetchall() if r[0] and r[0]>0]
-        if not fut or not entry:continue
-        re=pct(fut[-1],entry); up=pct(max(fut),entry); dn=pct(min(fut),entry)
-        c.execute('insert or replace into outcomes values(?,?,?,?,?,?,?,?,?,?)',
-                  (sid,h,sym,ts,re,up,dn,int(up>=4),int(up>=7),int(up>=10)));n+=1
-    c.commit();return n
+        fut=c.execute('select ts,price from snapshots where symbol=? and ts>? and ts<=? order by ts',
+                      (sym,ts,ts+h*60)).fetchall()
+        fut=[(fts,p) for fts,p in fut if p and p>0]
+        if not fut or not entry: continue
+        prices=[p for _,p in fut]
+        re=pct(prices[-1],entry); up=pct(max(prices),entry); dn=pct(min(prices),entry)
+        hit4_time=None
+        for fts,p in fut:
+            rr=pct(p,entry)
+            if rr is not None and rr>=4:
+                hit4_time=max(1,int(round((fts-ts)/60))); break
+        c.execute("""insert or replace into outcomes
+                     (snapshot_id,horizon,symbol,ts,ret_end,max_up,max_down,hit4,hit7,hit10,hit4_time)
+                     values(?,?,?,?,?,?,?,?,?,?,?)""",
+                  (sid,h,sym,ts,re,up,dn,int(up>=4),int(up>=7),int(up>=10),hit4_time))
+        n+=1
+    c.commit(); return n
 
-FEATURES=[('r1','1dk momentum'),('r3','3dk momentum'),('r5','5dk momentum'),('r10','10dk momentum'),('r30','30dk momentum'),('r60','60dk momentum'),('vr15','1dk hacim/5dk ort'),('vr310','3dk hacim/10dk ort'),('btc3','BTC farkÄ± 3dk'),('btc10','BTC farkÄ± 10dk'),('btc60','BTC farkÄ± 60dk'),('rsi14','RSI14'),('ema12gap','EMA12 farkÄ±'),('ema26gap','EMA26 farkÄ±'),('macdgap','EMA12-26 farkÄ±'),('stair5','basamak skoru'),('range24','24s aralÄ±k konumu'),('spread','spread')]
+
+FEATURES=[('r1','1dk momentum'),('r3','3dk momentum'),('r5','5dk momentum'),('r10','10dk momentum'),('r30','30dk momentum'),('r60','60dk momentum'),('vr15','1dk hacim/5dk ort'),('vr310','3dk hacim/10dk ort'),('btc3','BTC farkı 3dk'),('btc10','BTC farkı 10dk'),('btc60','BTC farkı 60dk'),('rsi14','RSI14'),('ema12gap','EMA12 farkı'),('ema26gap','EMA26 farkı'),('macdgap','EMA12-26 farkı'),('stair5','basamak skoru'),('range24','24s aralık konumu'),('spread','spread')]
 
 def summarize(c,hit='hit4',days=7,minrows=50):
     since=int(time.time())-days*86400
@@ -159,13 +188,59 @@ def summarize(c,hit='hit4',days=7,minrows=50):
         if len(vals)<minrows:continue
         try:q=statistics.quantiles(vals,n=4,method='inclusive')
         except:continue
-        bins=[('dÃ¼ÅÃ¼k',None,q[0]),('orta-alt',q[0],q[1]),('orta-Ã¼st',q[1],q[2]),('yÃ¼ksek',q[2],None)]
+        bins=[('düşük',None,q[0]),('orta-alt',q[0],q[1]),('orta-üst',q[1],q[2]),('yüksek',q[2],None)]
         for bn,lo,hi in bins:
             ss=[int(h) for v,h in rows if v is not None and (lo is None or float(v)>=lo) and (hi is None or float(v)<hi)]
             if len(ss)<10:continue
             rate=sum(ss)/len(ss);lift=rate/base if base else 0
             out.append((lift,rate,len(ss),name,bn,lo,hi))
     out.sort(reverse=True);return tot,hits,base,out[:10]
+
+
+def kombinasyon_analizi(c,days=7,min_n=30):
+    since=int(time.time())-days*86400
+    tot,hits=c.execute('select count(*),sum(hit4) from outcomes where horizon=? and ts>=?',
+                       (MAIN_HORIZON,since)).fetchone()
+    tot=tot or 0; hits=hits or 0; base=hits/tot if tot else 0
+
+    # İlk rapordaki bulgular doğrultusunda, tek değişken değil birlikte çalışan yapıları test eder.
+    kurallar = [
+        ("range24 >= 50", "s.range24>=50"),
+        ("vr310 0.7-3.0", "s.vr310>=0.7 and s.vr310<3.0"),
+        ("btc60 -0.1-0.3", "s.btc60>=-0.1 and s.btc60<0.3"),
+        ("stair5 < 75", "s.stair5<75"),
+        ("rsi14 50-72", "s.rsi14>=50 and s.rsi14<=72"),
+        ("r3 > 0", "s.r3>0"),
+        ("r10 > 0", "s.r10>0"),
+        ("macd > 0", "s.macdgap>0"),
+    ]
+
+    combos=[]
+    from itertools import combinations
+    for k in (2,3):
+        for items in combinations(kurallar,k):
+            name=' + '.join(x[0] for x in items)
+            where=' and '.join(x[1] for x in items)
+            rows=c.execute(f"""select o.hit4,o.max_up,o.max_down,o.hit4_time
+                               from outcomes o join snapshots s on s.id=o.snapshot_id
+                               where o.horizon=? and o.ts>=? and {where}""",
+                           (MAIN_HORIZON,since)).fetchall()
+            if len(rows)<min_n: continue
+            rate=sum(int(r[0] or 0) for r in rows)/len(rows)
+            lift=rate/base if base else 0
+            false=1-rate
+            ups=[float(r[1] or 0) for r in rows]
+            dns=[float(r[2] or 0) for r in rows]
+            wins=[float(r[1] or 0) for r in rows if r[0]]
+            loses=[float(r[2] or 0) for r in rows if not r[0]]
+            avg_win=sum(wins)/len(wins) if wins else 0
+            avg_loss=sum(loses)/len(loses) if loses else 0
+            ev=rate*avg_win+(1-rate)*avg_loss
+            times=[r[3] for r in rows if r[0] and r[3] is not None]
+            avg_t=sum(times)/len(times) if times else None
+            combos.append((ev,lift,rate,len(rows),false,sum(ups)/len(ups),sum(dns)/len(dns),avg_t,name))
+    combos.sort(reverse=True)
+    return base,combos[:6]
 
 def rngtxt(lo,hi):
     if lo is None:return f'<{hi:.2f}'
@@ -176,27 +251,45 @@ def report(c,days,final=False):
     a=summarize(c,'hit4',days,80 if final else 20)
     b=summarize(c,'hit7',days,80 if final else 20)
     d=summarize(c,'hit10',days,80 if final else 20)
+    base,combos=kombinasyon_analizi(c,days,50 if final else 25)
+
     lines=[
-        'ð§  7 GÃNLÃK BTC TURK PÄ°YASA RAPORU' if final else 'ð GÃNLÃK PÄ°YASA ÃÄRENME RAPORU',
+        '🧠 7 GÜNLÜK BTC TURK PİYASA RAPORU' if final else '📊 GÜNLÜK PİYASA ÖĞRENME RAPORU',
         '',
-        f'3s iÃ§inde +%4: %{a[2]*100:.1f} ({a[1]}/{a[0]})',
-        f'3s iÃ§inde +%7: %{b[2]*100:.1f} ({b[1]}/{b[0]})',
-        f'3s iÃ§inde +%10+: %{d[2]*100:.1f} ({d[1]}/{d[0]})'
+        f'3s içinde +%4: %{a[2]*100:.1f} ({a[1]}/{a[0]})',
+        f'3s içinde +%7: %{b[2]*100:.1f} ({b[1]}/{b[0]})',
+        f'3s içinde +%10+: %{d[2]*100:.1f} ({d[1]}/{d[0]})'
     ]
+
     if a[3]:
-        lines+=['','ð° +%4 yapanlarda Ã¶ne Ã§Ä±kanlar:']+[f'â¢ {x[3]} {rngtxt(x[5],x[6])} â %{x[1]*100:.1f}, bazÄ±n {x[0]:.2f}x (n={x[2]})' for x in a[3][:5]]
+        lines+=['','💰 +%4 yapanlarda öne çıkan tekil özellikler:']+[
+            f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.1f}, bazın {x[0]:.2f}x (n={x[2]})'
+            for x in a[3][:4]
+        ]
+
+    if combos:
+        lines+=['','🧩 +%4 için en iyi kombinasyonlar:']
+        for ev,lift,rate,n,false,aup,adn,avg_t,name in combos[:4]:
+            t=f", +%4 süresi ~{avg_t:.0f}dk" if avg_t is not None else ""
+            lines.append(
+                f'• {name} → başarı %{rate*100:.1f} (bazın {lift:.2f}x, n={n}), '
+                f'yanlış %{false*100:.1f}, ort.max +%{aup:.1f}, ort.ters %{adn:.1f}, EV %{ev:.2f}{t}'
+            )
+
     if final and b[3]:
-        lines+=['','ð +%7 yapanlarda Ã¶ne Ã§Ä±kanlar:']+[
-            f'â¢ {x[3]} {rngtxt(x[5],x[6])} â %{x[1]*100:.1f}, bazÄ±n {x[0]:.2f}x (n={x[2]})'
+        lines+=['','🚀 +%7 yapanlarda öne çıkanlar:']+[
+            f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.1f}, bazın {x[0]:.2f}x (n={x[2]})'
             for x in b[3][:5]
         ]
     if final and d[3]:
-        lines+=['','ð¥ +%10 ve Ã¼zeri yapanlarda Ã¶ne Ã§Ä±kanlar:']+[
-            f'â¢ {x[3]} {rngtxt(x[5],x[6])} â %{x[1]*100:.1f}, bazÄ±n {x[0]:.2f}x (n={x[2]})'
+        lines+=['','🔥 +%10 ve üzeri yapanlarda öne çıkanlar:']+[
+            f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.1f}, bazın {x[0]:.2f}x (n={x[2]})'
             for x in d[3][:5]
         ]
-    lines+=['','Not: Ä°lk hafta AL/SAT yok; bot piyasayÄ± Ã¶Äreniyor.']
+
+    lines+=['','Not: İlk hafta AL/SAT yok; bot piyasayı öğreniyor.']
     return '\n'.join(lines)
+
 
 def report_check(c):
     now=datetime.now(LOCAL_TZ); today=now.strftime('%Y-%m-%d')
@@ -220,12 +313,15 @@ def scan():
         except Exception as e:print('[FEATURE HATA]',sym,e)
     c.commit();lab=sum(label(c,h) for h in HORIZONS);report_check(c)
     sc=c.execute('select count(*) from snapshots').fetchone()[0]; oc=c.execute('select count(*) from outcomes').fetchone()[0]
-    print(f'[ÃÄRENÄ°YOR] TRY={len(xs)} kayÄ±t={n} snapshots={sc} outcomes={oc} yeni={lab}')
+    print(f'[ÖĞRENİYOR] TRY={len(xs)} kayıt={n} snapshots={sc} outcomes={oc} yeni={lab}')
     c.close()
 
 def main():
     setup();print('BTC TURK PIYASA OGRENEN BOT V2 (+4/+7/+10)',DB_PATH)
-    tg('ð§  PÄ°YASA ÃÄRENEN BOT BAÅLADI\nBtcTurk TRY piyasasÄ±nÄ±n tamamÄ±nÄ± kriter koymadan izleyecek.\nÄ°lk hafta AL/SAT yok; her gÃ¼n kÄ±sa rapor, 7. gÃ¼n +%4/+%7/+%10+ ortak Ã¶zellik raporu.')
+    tg('\U0001F9E0 P\u0130YASA \u00D6\u011ERENEN BOT BA\u015ELADI\n'
+       'BtcTurk TRY piyasas\u0131n\u0131n tamam\u0131n\u0131 kriter koymadan izleyecek.\n'
+       '\u0130lk hafta AL/SAT yok; her g\u00FCn k\u0131sa rapor, '
+       '7. g\u00FCn +%4/+%7/+%10+ ortak \u00F6zellik raporu.')
     while True:
         t=time.time()
         try:scan()
