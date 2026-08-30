@@ -68,14 +68,20 @@ def setup():
     c.execute('create index if not exists ix_ss on snapshots(symbol,ts)')
     c.execute('''create table if not exists outcomes(
       snapshot_id integer,horizon integer,symbol text,ts integer,ret_end real,max_up real,max_down real,
-      hit4 integer,hit7 integer,hit10 integer,hit4_time integer,
+      hit4 integer,hit7 integer,hit10 integer,hit20 integer,hit50 integer,hit100 integer,hit4_time integer,
       primary key(snapshot_id,horizon))''')
     cols=[r[1] for r in c.execute('pragma table_info(outcomes)').fetchall()]
     if 'hit10' not in cols:
         c.execute('alter table outcomes add column hit10 integer default 0')
+    if 'hit20' not in cols:
+        c.execute('alter table outcomes add column hit20 integer default 0')
+    if 'hit50' not in cols:
+        c.execute('alter table outcomes add column hit50 integer default 0')
+    if 'hit100' not in cols:
+        c.execute('alter table outcomes add column hit100 integer default 0')
     if 'hit4_time' not in cols:
         c.execute('alter table outcomes add column hit4_time integer')
-    c.execute('create index if not exists ix_oh on outcomes(horizon,hit4,hit7,hit10)')
+    c.execute('create index if not exists ix_oh on outcomes(horizon,hit4,hit7,hit10,hit20,hit50,hit100)')
     if meta_get(c,'start_ts') is None: meta_set(c,'start_ts',int(time.time()))
     if meta_get(c,'last_daily') is None: meta_set(c,'last_daily','')
     if meta_get(c,'final_sent') is None: meta_set(c,'final_sent','0')
@@ -169,9 +175,12 @@ def label(c,h,batch=800):
             if rr is not None and rr>=4:
                 hit4_time=max(1,int(round((fts-ts)/60))); break
         c.execute("""insert or replace into outcomes
-                     (snapshot_id,horizon,symbol,ts,ret_end,max_up,max_down,hit4,hit7,hit10,hit4_time)
-                     values(?,?,?,?,?,?,?,?,?,?,?)""",
-                  (sid,h,sym,ts,re,up,dn,int(up>=4),int(up>=7),int(up>=10),hit4_time))
+                     (snapshot_id,horizon,symbol,ts,ret_end,max_up,max_down,
+                      hit4,hit7,hit10,hit20,hit50,hit100,hit4_time)
+                     values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (sid,h,sym,ts,re,up,dn,
+                   int(up>=4),int(up>=7),int(up>=10),int(up>=20),int(up>=50),int(up>=100),
+                   hit4_time))
         n+=1
     c.commit(); return n
 
@@ -251,6 +260,9 @@ def report(c,days,final=False):
     a=summarize(c,'hit4',days,80 if final else 20)
     b=summarize(c,'hit7',days,80 if final else 20)
     d=summarize(c,'hit10',days,80 if final else 20)
+    e=summarize(c,'hit20',days,80 if final else 20)
+    f=summarize(c,'hit50',days,80 if final else 20)
+    g=summarize(c,'hit100',days,80 if final else 20)
     base,combos=kombinasyon_analizi(c,days,50 if final else 25)
 
     lines=[
@@ -258,7 +270,10 @@ def report(c,days,final=False):
         '',
         f'3s içinde +%4: %{a[2]*100:.1f} ({a[1]}/{a[0]})',
         f'3s içinde +%7: %{b[2]*100:.1f} ({b[1]}/{b[0]})',
-        f'3s içinde +%10+: %{d[2]*100:.1f} ({d[1]}/{d[0]})'
+        f'3s içinde +%10+: %{d[2]*100:.1f} ({d[1]}/{d[0]})',
+        f'3s içinde +%20+: %{e[2]*100:.2f} ({e[1]}/{e[0]})',
+        f'3s içinde +%50+: %{f[2]*100:.2f} ({f[1]}/{f[0]})',
+        f'3s içinde +%100+: %{g[2]*100:.3f} ({g[1]}/{g[0]})'
     ]
 
     if a[3]:
@@ -285,6 +300,22 @@ def report(c,days,final=False):
         lines+=['','🔥 +%10 ve üzeri yapanlarda öne çıkanlar:']+[
             f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.1f}, bazın {x[0]:.2f}x (n={x[2]})'
             for x in d[3][:5]
+        ]
+
+    if final and e[3]:
+        lines+=['','🚀 +%20 ve üzeri yapanlarda öne çıkanlar:']+[
+            f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.2f}, bazın {x[0]:.2f}x (n={x[2]})'
+            for x in e[3][:5]
+        ]
+    if final and f[3]:
+        lines+=['','💥 +%50 ve üzeri yapanlarda öne çıkanlar:']+[
+            f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.2f}, bazın {x[0]:.2f}x (n={x[2]})'
+            for x in f[3][:5]
+        ]
+    if final and g[3]:
+        lines+=['','🧨 +%100 ve üzeri yapanlarda öne çıkanlar:']+[
+            f'• {x[3]} {rngtxt(x[5],x[6])} → %{x[1]*100:.3f}, bazın {x[0]:.2f}x (n={x[2]})'
+            for x in g[3][:5]
         ]
 
     lines+=['','Not: İlk hafta AL/SAT yok; bot piyasayı öğreniyor.']
