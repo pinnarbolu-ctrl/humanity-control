@@ -64,8 +64,20 @@ def setup():
       r1 real,r3 real,r5 real,r10 real,r30 real,r60 real,
       vol1 real,vol3 real,vol5 real,vol10 real,vr15 real,vr310 real,
       btc3 real,btc10 real,btc60 real,rsi14 real,ema12gap real,ema26gap real,macdgap real,
-      stair5 real,range24 real,spread real, unique(ts,symbol))''')
+      stair5 real,range24 real,spread real,
+      btc_r3 real,btc_r10 real,btc_r60 real,
+      breadth3 real,breadth10 real,breadth60 real,
+      market_med3 real,market_med10 real,market_med60 real,
+      unique(ts,symbol))''')
     c.execute('create index if not exists ix_ss on snapshots(symbol,ts)')
+
+    # V7: Genel piyasa/BTC rejimini her snapshot ile birlikte sakla.
+    snap_cols=[r[1] for r in c.execute('pragma table_info(snapshots)').fetchall()]
+    for col in ('btc_r3','btc_r10','btc_r60','breadth3','breadth10','breadth60',
+                'market_med3','market_med10','market_med60'):
+        if col not in snap_cols:
+            c.execute(f'alter table snapshots add column {col} real')
+
     c.execute('''create table if not exists outcomes(
       snapshot_id integer,horizon integer,symbol text,ts integer,ret_end real,max_up real,max_down real,
       hit4 integer,hit7 integer,hit10 integer,hit20 integer,hit50 integer,hit100 integer,
@@ -152,10 +164,17 @@ def features(c,sym,ts,x,btc=None):
     b60=(rr[60]-btc['r60']) if btc and rr[60] is not None and btc.get('r60') is not None else None
     return [p,bid,ask,hi,lo,op,v,rr[1],rr[3],rr[5],rr[10],rr[30],rr[60],vv[1],vv[3],vv[5],vv[10],vr15,vr310,b3,b10,b60,rsi(vals),pct(p,e12) if e12 else None,pct(p,e26) if e26 else None,((e12-e26)/p*100) if e12 and e26 else None,stair,rng,spread]
 
-COLS='price,bid,ask,high24,low24,open24,volume24,r1,r3,r5,r10,r30,r60,vol1,vol3,vol5,vol10,vr15,vr310,btc3,btc10,btc60,rsi14,ema12gap,ema26gap,macdgap,stair5,range24,spread'
-def insert_snap(c,ts,sym,vals):
-    q=','.join('?' for _ in range(31))
-    c.execute(f'insert or ignore into snapshots(ts,symbol,{COLS}) values({q})',[ts,sym]+vals)
+COLS='price,bid,ask,high24,low24,open24,volume24,r1,r3,r5,r10,r30,r60,vol1,vol3,vol5,vol10,vr15,vr310,btc3,btc10,btc60,rsi14,ema12gap,ema26gap,macdgap,stair5,range24,spread,btc_r3,btc_r10,btc_r60,breadth3,breadth10,breadth60,market_med3,market_med10,market_med60'
+def insert_snap(c,ts,sym,vals,regime=None):
+    regime=regime or {}
+    extra=[
+        regime.get('btc_r3'),regime.get('btc_r10'),regime.get('btc_r60'),
+        regime.get('breadth3'),regime.get('breadth10'),regime.get('breadth60'),
+        regime.get('market_med3'),regime.get('market_med10'),regime.get('market_med60')
+    ]
+    allvals=list(vals)+extra
+    q=','.join('?' for _ in range(2+len(allvals)))
+    c.execute(f'insert or ignore into snapshots(ts,symbol,{COLS}) values({q})',[ts,sym]+allvals)
 
 
 def label(c,h,batch=800):
@@ -255,6 +274,88 @@ def kombinasyon_analizi(c,days=7,min_n=30):
     combos.sort(reverse=True)
     return base,combos[:6]
 
+
+def _median_or_none(vals):
+    vals=[float(x) for x in vals if x is not None and math.isfinite(float(x))]
+    return statistics.median(vals) if vals else None
+
+def market_regime_from_features(feature_map, btc_f):
+    """Aynı dakikadaki bütün TRY coinlerinden piyasa genişliği ve medyan momentum üretir."""
+    non_btc=[v for sym,v in feature_map.items() if sym!='BTCTRY' and v]
+    def vals_at(idx):
+        return [v[idx] for v in non_btc if len(v)>idx and v[idx] is not None]
+    r3s,r10s,r60s=vals_at(8),vals_at(10),vals_at(12)
+
+    def breadth(vals):
+        vals=[float(x) for x in vals if x is not None and math.isfinite(float(x))]
+        return (100.0*sum(1 for x in vals if x>0)/len(vals)) if vals else None
+
+    return {
+        'btc_r3': (btc_f or {}).get('r3'),
+        'btc_r10': (btc_f or {}).get('r10'),
+        'btc_r60': (btc_f or {}).get('r60'),
+        'breadth3': breadth(r3s),
+        'breadth10': breadth(r10s),
+        'breadth60': breadth(r60s),
+        'market_med3': _median_or_none(r3s),
+        'market_med10': _median_or_none(r10s),
+        'market_med60': _median_or_none(r60s),
+    }
+
+REGIME_FIELDS=[
+    ('btc_r3','BTC 3dk'),
+    ('btc_r10','BTC 10dk'),
+    ('btc_r60','BTC 60dk'),
+    ('breadth3','Pozitif coin oranı 3dk'),
+    ('breadth10','Pozitif coin oranı 10dk'),
+    ('breadth60','Pozitif coin oranı 60dk'),
+    ('market_med3','Piyasa medyanı 3dk'),
+    ('market_med10','Piyasa medyanı 10dk'),
+    ('market_med60','Piyasa medyanı 60dk'),
+]
+
+def rejim_analizi(c,days=7,min_group=30):
+    """+%4 yapanlarla ilk güçlenip sönenleri, aynı anda kaydedilen genel piyasa rejiminde karşılaştır."""
+    since=int(time.time())-days*86400
+    out=[]
+    for col,name in REGIME_FIELDS:
+        wins=c.execute(f"""select s.{col}
+                           from outcomes o join snapshots s on s.id=o.snapshot_id
+                           where o.horizon=? and o.ts>=? and o.hit4=1 and s.{col} is not null""",
+                       (MAIN_HORIZON,since)).fetchall()
+        fails=c.execute(f"""select s.{col}
+                            from outcomes o join snapshots s on s.id=o.snapshot_id
+                            where o.horizon=? and o.ts>=? and o.fail_continue=1 and s.{col} is not null""",
+                        (MAIN_HORIZON,since)).fetchall()
+        w=[float(x[0]) for x in wins if x[0] is not None and math.isfinite(float(x[0]))]
+        f=[float(x[0]) for x in fails if x[0] is not None and math.isfinite(float(x[0]))]
+        if len(w)<min_group or len(f)<min_group:
+            continue
+        wm=statistics.median(w); fm=statistics.median(f)
+        diff=wm-fm
+        # Ölçekleri farklı olduğu için sıralamada standartlaştırılmış fark kullan.
+        pooled=w+f
+        sd=statistics.pstdev(pooled) if len(pooled)>1 else 0
+        effect=abs(diff)/(sd or 1e-9)
+        out.append((effect,diff,wm,fm,len(w),len(f),name,col))
+    out.sort(reverse=True)
+    return out
+
+def piyasa_rejimi_ozeti(regime_rows):
+    if not regime_rows:
+        return []
+    lines=['','🌍 +%4 yapanı sönenden ayıran BTC / piyasa rejimi:']
+    for effect,diff,wm,fm,nw,nf,name,col in regime_rows[:5]:
+        if col.startswith('breadth'):
+            lines.append(
+                f'• {name}: başarılı %{wm:.1f}, sönen %{fm:.1f} → fark {diff:+.1f} puan (n={nw}/{nf})'
+            )
+        else:
+            lines.append(
+                f'• {name}: başarılı {wm:+.2f}%, sönen {fm:+.2f}% → fark {diff:+.2f} puan (n={nw}/{nf})'
+            )
+    return lines
+
 def rngtxt(lo,hi):
     if lo is None:return f'<{hi:.2f}'
     if hi is None:return f'>={lo:.2f}'
@@ -269,6 +370,7 @@ def report(c,days,final=False):
     g=summarize(c,'hit100',days,80 if final else 20)
     fail=summarize(c,'fail_continue',days,80 if final else 20)
     base,combos=kombinasyon_analizi(c,days,50 if final else 25)
+    regime_rows=rejim_analizi(c,days,80 if final else 30)
 
     lines=[
         '🧠 7 GÜNLÜK BTC TURK PİYASA RAPORU' if final else '📊 GÜNLÜK PİYASA ÖĞRENME RAPORU',
@@ -330,6 +432,10 @@ def report(c,days,final=False):
             for x in fail[3][:5]
         ]
 
+    lines += piyasa_rejimi_ozeti(regime_rows)
+    if not regime_rows:
+        lines += ['','🌍 BTC / piyasa rejimi: yeni rejim verisi henüz yeterli değil; veri biriktikçe başarılı-sönen karşılaştırması burada görünecek.']
+
     lines+=['','Not: İlk hafta AL/SAT yok; bot piyasayı öğreniyor.']
     return '\n'.join(lines)
 
@@ -347,24 +453,44 @@ def scan():
     ts=int(time.time());ts-=ts%60; xs=ticker(); c=db()
     btc_x=next((x for x in xs if (x.get('pair') or '').upper()=='BTCTRY'),None)
     btc_f=None
+    feature_map={}
+
+    # Önce BTC ve tüm coin özelliklerini hesapla; böylece o dakikanın piyasa genişliği
+    # her coin snapshot'ına aynı, tutarlı rejim etiketiyle yazılabilir.
     if btc_x:
-        vals=features(c,'BTCTRY',ts,btc_x,None);btc_f={'r3':vals[8],'r10':vals[10],'r60':vals[12]}
-    n=0
+        vals=features(c,'BTCTRY',ts,btc_x,None)
+        feature_map['BTCTRY']=vals
+        btc_f={'r3':vals[8],'r10':vals[10],'r60':vals[12]}
+
     for x in xs:
         sym=(x.get('pair') or '').upper()
-        try:insert_snap(c,ts,sym,features(c,sym,ts,x,None if sym=='BTCTRY' else btc_f));n+=1
-        except Exception as e:print('[FEATURE HATA]',sym,e)
+        if sym=='BTCTRY':
+            continue
+        try:
+            feature_map[sym]=features(c,sym,ts,x,btc_f)
+        except Exception as e:
+            print('[FEATURE HATA]',sym,e)
+
+    regime=market_regime_from_features(feature_map,btc_f)
+    n=0
+    for sym,vals in feature_map.items():
+        try:
+            insert_snap(c,ts,sym,vals,regime)
+            n+=1
+        except Exception as e:
+            print('[SNAPSHOT HATA]',sym,e)
+
     c.commit();lab=sum(label(c,h) for h in HORIZONS);report_check(c)
     sc=c.execute('select count(*) from snapshots').fetchone()[0]; oc=c.execute('select count(*) from outcomes').fetchone()[0]
     print(f'[ÖĞRENİYOR] TRY={len(xs)} kayıt={n} snapshots={sc} outcomes={oc} yeni={lab}')
     c.close()
 
 def main():
-    setup();print('BTC TURK PIYASA OGRENEN BOT V2 (+4/+7/+10)',DB_PATH)
+    setup();print('BTC TURK PIYASA OGRENEN BOT V7 (BTC + PIYASA REJIMI)',DB_PATH)
     tg('\U0001F9E0 P\u0130YASA \u00D6\u011ERENEN BOT BA\u015ELADI\n'
        'BtcTurk TRY piyasas\u0131n\u0131n tamam\u0131n\u0131 kriter koymadan izleyecek.\n'
        '\u0130lk hafta AL/SAT yok; her g\u00FCn k\u0131sa rapor, '
-       '7. g\u00FCn +%4/+%7/+%10+ ortak \u00F6zellik raporu.')
+       '7. g\u00FCn +%4/+%7/+%10+ ortak \u00F6zellik + BTC/piyasa rejimi raporu.')
     while True:
         t=time.time()
         try:scan()
