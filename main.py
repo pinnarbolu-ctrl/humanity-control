@@ -68,13 +68,16 @@ def setup():
       btc_r3 real,btc_r10 real,btc_r60 real,
       breadth3 real,breadth10 real,breadth60 real,
       market_med3 real,market_med10 real,market_med60 real,
+      rel_mkt3 real,rel_mkt10 real,rel_mkt60 real,
+      rel_btc3 real,rel_btc10 real,rel_btc60 real,
       unique(ts,symbol))''')
     c.execute('create index if not exists ix_ss on snapshots(symbol,ts)')
 
     # V7: Genel piyasa/BTC rejimini her snapshot ile birlikte sakla.
     snap_cols=[r[1] for r in c.execute('pragma table_info(snapshots)').fetchall()]
     for col in ('btc_r3','btc_r10','btc_r60','breadth3','breadth10','breadth60',
-                'market_med3','market_med10','market_med60'):
+                'market_med3','market_med10','market_med60',
+                'rel_mkt3','rel_mkt10','rel_mkt60','rel_btc3','rel_btc10','rel_btc60'):
         if col not in snap_cols:
             c.execute(f'alter table snapshots add column {col} real')
 
@@ -164,13 +167,28 @@ def features(c,sym,ts,x,btc=None):
     b60=(rr[60]-btc['r60']) if btc and rr[60] is not None and btc.get('r60') is not None else None
     return [p,bid,ask,hi,lo,op,v,rr[1],rr[3],rr[5],rr[10],rr[30],rr[60],vv[1],vv[3],vv[5],vv[10],vr15,vr310,b3,b10,b60,rsi(vals),pct(p,e12) if e12 else None,pct(p,e26) if e26 else None,((e12-e26)/p*100) if e12 and e26 else None,stair,rng,spread]
 
-COLS='price,bid,ask,high24,low24,open24,volume24,r1,r3,r5,r10,r30,r60,vol1,vol3,vol5,vol10,vr15,vr310,btc3,btc10,btc60,rsi14,ema12gap,ema26gap,macdgap,stair5,range24,spread,btc_r3,btc_r10,btc_r60,breadth3,breadth10,breadth60,market_med3,market_med10,market_med60'
+COLS='price,bid,ask,high24,low24,open24,volume24,r1,r3,r5,r10,r30,r60,vol1,vol3,vol5,vol10,vr15,vr310,btc3,btc10,btc60,rsi14,ema12gap,ema26gap,macdgap,stair5,range24,spread,btc_r3,btc_r10,btc_r60,breadth3,breadth10,breadth60,market_med3,market_med10,market_med60,rel_mkt3,rel_mkt10,rel_mkt60,rel_btc3,rel_btc10,rel_btc60'
 def insert_snap(c,ts,sym,vals,regime=None):
     regime=regime or {}
+    r3 = vals[8] if len(vals) > 8 else None
+    r10 = vals[10] if len(vals) > 10 else None
+    r60 = vals[12] if len(vals) > 12 else None
+    def diff(a,b):
+        try:
+            return float(a)-float(b) if a is not None and b is not None else None
+        except Exception:
+            return None
+    rel_mkt3 = diff(r3, regime.get('market_med3'))
+    rel_mkt10 = diff(r10, regime.get('market_med10'))
+    rel_mkt60 = diff(r60, regime.get('market_med60'))
+    rel_btc3 = diff(r3, regime.get('btc_r3'))
+    rel_btc10 = diff(r10, regime.get('btc_r10'))
+    rel_btc60 = diff(r60, regime.get('btc_r60'))
     extra=[
         regime.get('btc_r3'),regime.get('btc_r10'),regime.get('btc_r60'),
         regime.get('breadth3'),regime.get('breadth10'),regime.get('breadth60'),
-        regime.get('market_med3'),regime.get('market_med10'),regime.get('market_med60')
+        regime.get('market_med3'),regime.get('market_med10'),regime.get('market_med60'),
+        rel_mkt3,rel_mkt10,rel_mkt60,rel_btc3,rel_btc10,rel_btc60
     ]
     allvals=list(vals)+extra
     q=','.join('?' for _ in range(2+len(allvals)))
@@ -356,6 +374,94 @@ def piyasa_rejimi_ozeti(regime_rows):
             )
     return lines
 
+RELATIVE_FIELDS=[
+    ('rel_mkt3','Coin - piyasa 3dk'),
+    ('rel_mkt10','Coin - piyasa 10dk'),
+    ('rel_mkt60','Coin - piyasa 60dk'),
+    ('rel_btc3','Coin - BTC 3dk'),
+    ('rel_btc10','Coin - BTC 10dk'),
+    ('rel_btc60','Coin - BTC 60dk'),
+]
+
+def goreceli_guc_analizi(c,days=7,min_group=30):
+    since=int(time.time())-days*86400
+    out=[]
+    for col,name in RELATIVE_FIELDS:
+        wins=c.execute(f"""select s.{col} from outcomes o join snapshots s on s.id=o.snapshot_id
+                           where o.horizon=? and o.ts>=? and o.hit4=1 and s.{col} is not null""",
+                       (MAIN_HORIZON,since)).fetchall()
+        fails=c.execute(f"""select s.{col} from outcomes o join snapshots s on s.id=o.snapshot_id
+                            where o.horizon=? and o.ts>=? and o.fail_continue=1 and s.{col} is not null""",
+                        (MAIN_HORIZON,since)).fetchall()
+        w=[float(x[0]) for x in wins if x[0] is not None and math.isfinite(float(x[0]))]
+        f=[float(x[0]) for x in fails if x[0] is not None and math.isfinite(float(x[0]))]
+        if len(w)<min_group or len(f)<min_group: continue
+        wm=statistics.median(w); fm=statistics.median(f); diff=wm-fm
+        pooled=w+f; sd=statistics.pstdev(pooled) if len(pooled)>1 else 0
+        effect=abs(diff)/(sd or 1e-9)
+        out.append((effect,diff,wm,fm,len(w),len(f),name,col))
+    out.sort(reverse=True)
+    return out
+
+def goreceli_guc_ozeti(rows):
+    if not rows: return []
+    lines=['','🎯 +%4 yapanı sönenden ayıran göreceli güç:']
+    for effect,diff,wm,fm,nw,nf,name,col in rows[:6]:
+        lines.append(f'• {name}: başarılı {wm:+.2f} puan, sönen {fm:+.2f} puan → fark {diff:+.2f} (n={nw}/{nf})')
+    return lines
+
+def goreceli_guc_esik_analizi(c,days=7,min_n=80):
+    """Göreceli güç alanlarında +%4 başarı oranını yükselten eşikleri bulur.
+    Yalnız öğrenme/raporlama içindir; AL filtresine dokunmaz.
+    """
+    since=int(time.time())-days*86400
+    base_row=c.execute("""select count(*),sum(case when hit4=1 then 1 else 0 end)
+                          from outcomes where horizon=? and ts>=?""",
+                       (MAIN_HORIZON,since)).fetchone()
+    total=int(base_row[0] or 0); hits=int(base_row[1] or 0)
+    base=(hits/total) if total else 0.0
+    out=[]
+    for col,name in RELATIVE_FIELDS:
+        rows=c.execute(f"""select s.{col},o.hit4,o.max_up,o.max_down,o.t_hit4
+                           from outcomes o join snapshots s on s.id=o.snapshot_id
+                           where o.horizon=? and o.ts>=? and s.{col} is not null""",
+                       (MAIN_HORIZON,since)).fetchall()
+        vals=[float(r[0]) for r in rows if r[0] is not None and math.isfinite(float(r[0]))]
+        if len(vals)<max(min_n*2,200): continue
+        try: qs=statistics.quantiles(vals,n=10,method='inclusive')
+        except Exception: continue
+        seen=set()
+        for thr in qs:
+            thr=float(thr)
+            for op in ('>','<'):
+                key=(op,round(thr,8))
+                if key in seen: continue
+                seen.add(key)
+                ss=[r for r in rows if r[0] is not None and ((float(r[0])>thr) if op=='>' else (float(r[0])<thr))]
+                n=len(ss)
+                if n<min_n: continue
+                rate=sum(int(r[1] or 0) for r in ss)/n
+                lift=(rate/base) if base else 0.0
+                wins=[float(r[2] or 0) for r in ss if r[1]]
+                losses=[float(r[3] or 0) for r in ss if not r[1]]
+                avg_win=sum(wins)/len(wins) if wins else 0.0
+                avg_loss=sum(losses)/len(losses) if losses else 0.0
+                ev=rate*avg_win+(1-rate)*avg_loss
+                times=[float(r[4]) for r in ss if r[1] and r[4] is not None]
+                avg_t=sum(times)/len(times) if times else None
+                if lift>1.05:
+                    out.append((lift,rate,ev,n,avg_t,name,col,op,thr))
+    out.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
+    return base,out[:8]
+
+def goreceli_guc_esik_ozeti(base,rows):
+    if not rows: return []
+    lines=['','🧪 Göreceli güçte işe yarayan eşikler:']
+    for lift,rate,ev,n,avg_t,name,col,op,thr in rows[:6]:
+        t=f", +%4 süresi ~{avg_t:.0f}dk" if avg_t is not None else ""
+        lines.append(f'• {name} {op} {thr:+.2f} → başarı %{rate*100:.1f} (bazın {lift:.2f}x, n={n}), EV %{ev:.2f}{t}')
+    return lines
+
 def rngtxt(lo,hi):
     if lo is None:return f'<{hi:.2f}'
     if hi is None:return f'>={lo:.2f}'
@@ -371,6 +477,8 @@ def report(c,days,final=False):
     fail=summarize(c,'fail_continue',days,80 if final else 20)
     base,combos=kombinasyon_analizi(c,days,50 if final else 25)
     regime_rows=rejim_analizi(c,days,80 if final else 30)
+    relative_rows=goreceli_guc_analizi(c,days,80 if final else 30)
+    relative_base,relative_thresholds=goreceli_guc_esik_analizi(c,days,200 if final else 80)
 
     lines=[
         '🧠 7 GÜNLÜK BTC TURK PİYASA RAPORU' if final else '📊 GÜNLÜK PİYASA ÖĞRENME RAPORU',
@@ -436,6 +544,14 @@ def report(c,days,final=False):
     if not regime_rows:
         lines += ['','🌍 BTC / piyasa rejimi: yeni rejim verisi henüz yeterli değil; veri biriktikçe başarılı-sönen karşılaştırması burada görünecek.']
 
+    lines += goreceli_guc_ozeti(relative_rows)
+    if not relative_rows:
+        lines += ['','🎯 Göreceli güç: yeni ayrışma verisi henüz yeterli değil; coin-piyasa ve coin-BTC farkları veri biriktikçe burada görünecek.']
+
+    lines += goreceli_guc_esik_ozeti(relative_base,relative_thresholds)
+    if not relative_thresholds:
+        lines += ['','🧪 Göreceli güç eşikleri: henüz yeterince güçlü ve tekrarlanan bir eşik bulunamadı.']
+
     lines+=['','Not: İlk hafta AL/SAT yok; bot piyasayı öğreniyor.']
     return '\n'.join(lines)
 
@@ -486,7 +602,7 @@ def scan():
     c.close()
 
 def main():
-    setup();print('BTC TURK PIYASA OGRENEN BOT V7 (BTC + PIYASA REJIMI)',DB_PATH)
+    setup();print('BTC TURK PIYASA OGRENEN BOT V8.1 (GORECELI GUC + ESIK)',DB_PATH)
     tg('\U0001F9E0 P\u0130YASA \u00D6\u011ERENEN BOT BA\u015ELADI\n'
        'BtcTurk TRY piyasas\u0131n\u0131n tamam\u0131n\u0131 kriter koymadan izleyecek.\n'
        '\u0130lk hafta AL/SAT yok; her g\u00FCn k\u0131sa rapor, '
